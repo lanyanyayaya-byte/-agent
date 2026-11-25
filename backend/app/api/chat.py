@@ -17,7 +17,7 @@ from app.security import ApiError
 from app.services.hybrid_retrieval import CoverageMode, MAX_COMPARISON_DOCUMENTS, RetrievalMode
 from app.services.library import DOCUMENT_ID_PATTERN
 from app.services.runs import (
-    KnowledgeRunConfig, McpRunConfig, RunNotCancellable, RunService, RunServiceStopping, RunStream,
+    KnowledgeRunConfig, McpRunConfig, RunNotCancellable, RunService, RunServiceStopping, RunStream, SkillsRunConfig,
 )
 from app.storage.business import (
     BusinessStore, Message, RunConflict, RunNotFound, RunStatus, RunSummary, Session, SessionNotFound,
@@ -60,6 +60,16 @@ class McpRunOptions(BaseModel):
     allow_external_data_egress: bool = False
 
 
+class SkillsRunOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool = False
+    selected_skill_ids: Annotated[
+        list[Annotated[str, StringConstraints(min_length=1, max_length=128)]],
+        Field(max_length=32),
+    ] = Field(default_factory=list)
+
+
 class StartRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -71,6 +81,9 @@ class StartRun(BaseModel):
     ]
     knowledge: KnowledgeQueryOptions | None = None
     mcp: McpRunOptions | None = None
+    skills: SkillsRunOptions | None = None
+    attachment_ids: Annotated[list[UUID], Field(max_length=32)] = Field(default_factory=list)
+    artifact_ids: Annotated[list[UUID], Field(max_length=32)] = Field(default_factory=list)
 
 
 class RunPage(BaseModel):
@@ -209,12 +222,21 @@ def chat_router(runs: RunService, store: BusinessStore, require_ui, require_read
                 enabled=body.mcp.enabled,
                 allow_external_data_egress=body.mcp.allow_external_data_egress,
             )
+        skills_cfg: SkillsRunConfig | None = None
+        if body.skills is not None or body.attachment_ids or body.artifact_ids:
+            skills_cfg = SkillsRunConfig(
+                enabled=bool(body.skills.enabled) if body.skills is not None else False,
+                selected_skill_ids=tuple(body.skills.selected_skill_ids) if body.skills is not None else (),
+                attachment_ids=tuple(str(fid) for fid in body.attachment_ids),
+                artifact_ids=tuple(str(aid) for aid in body.artifact_ids),
+            )
         try:
             stream = await runs.start(
                 str(session_id), str(body.client_request_id), body.message,
                 request_id=request.state.request_id,
                 **({"knowledge": knowledge_cfg} if knowledge_cfg is not None else {}),
                 **({"mcp": mcp_cfg} if mcp_cfg is not None else {}),
+                **({"skills": skills_cfg} if skills_cfg is not None else {}),
             )
         except SessionNotFound:
             raise ApiError(404, "NOT_FOUND", "未找到该会话。") from None

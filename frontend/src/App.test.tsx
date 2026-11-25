@@ -47,6 +47,8 @@ test('keeps the active session and SSE draft while the library is open', async (
     if (path === `/sessions/${sessionId}/runs`) return Response.json({ items: [], next_cursor: null });
     if (path === '/mcp/summary') return Response.json(emptyMcpSummary);
     if (path === '/mcp/servers') return Response.json([]);
+    if (path === '/skills') return Response.json([]);
+    if (path === `/sessions/${sessionId}/workspace`) return Response.json({ session_id: sessionId, files: [], artifacts: [] });
     if ([`/sessions/${sessionId}/messages`, `/sessions/${sessionId}/grants`, '/knowledge/documents'].includes(path)) {
       return Response.json([]);
     }
@@ -117,6 +119,7 @@ test('requests the host connection, authenticates the status call and retries af
   vi.stubGlobal('fetch', (url: string, options: RequestInit) => {
     if (url.endsWith('/sessions')) return Promise.resolve(Response.json([]));
     if (url.endsWith('/mcp/summary')) return Promise.resolve(Response.json(emptyMcpSummary));
+    if (url.endsWith('/skills')) return Promise.resolve(Response.json([]));
     return fetchStatus(url, options);
   });
 
@@ -162,6 +165,7 @@ test('submits the password only to the credential IPC and clears it immediately'
   vi.stubGlobal('fetch', (url: string, options: RequestInit) => {
     if (url.endsWith('/sessions')) return Promise.resolve(Response.json([]));
     if (url.endsWith('/mcp/summary')) return Promise.resolve(Response.json(emptyMcpSummary));
+    if (url.endsWith('/skills')) return Promise.resolve(Response.json([]));
     return fetchStatus(url, options);
   });
 

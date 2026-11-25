@@ -7,9 +7,18 @@ from typing import Any
 
 from pydantic import PrivateAttr, SecretStr
 
-from app.models import ModelError
+from app.diagnostics import record
+from app.models import ModelError, RetryableModelError
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+_CONTEXT_LIMIT_HINTS = (
+    "context length",
+    "maximum context",
+    "too many tokens",
+    "token limit",
+    "context_length_exceeded",
+    "max_prompt_tokens",
+)
 
 
 @dataclass(frozen=True)
@@ -51,9 +60,11 @@ def _translate_deepseek_error(
     *,
     allow_remote_protocol_passthrough: bool = False,
 ) -> ModelError | None:
-    """Map DeepSeek/OpenAI/httpx request exceptions into sanitized ModelError values.
+    """Map DeepSeek/OpenAI/httpx request exceptions into classified, sanitized ModelError values.
 
-    Returns None if the caller should re-raise `httpx.RemoteProtocolError` for tool-graph retry.
+    - Transient errors (network/timeout/stream-disconnect/HTTP 429/408/5xx) map to `RetryableModelError`.
+    - Permanent errors (HTTP 401/402/400/422, context limit) map to non-retryable `ModelError`.
+    - Returns None if caller should re-raise `httpx.RemoteProtocolError` for stream retry.
     """
     import httpx
     from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
@@ -63,27 +74,82 @@ def _translate_deepseek_error(
 
     remote_proto = _find_cause(error, httpx.RemoteProtocolError)
     if remote_proto is not None:
+        record("deepseek_api_error", exception_type="RemoteProtocolError", reason_kind="stream_disconnect", retryable=True)
         if allow_remote_protocol_passthrough:
             return None
-        return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 响应流中断。")
+        return RetryableModelError(
+            "MODEL_UPSTREAM_ERROR",
+            "DeepSeek 响应流中断（网络连接波动）。",
+            reason_kind="stream_disconnect",
+            prefer_non_streaming=True,
+        )
 
     if _find_cause(error, httpx.ConnectTimeout) is not None:
-        return ModelError("MODEL_TIMEOUT", "连接 DeepSeek 网络超时。")
+        record("deepseek_api_error", exception_type="ConnectTimeout", reason_kind="timeout", retryable=True)
+        return RetryableModelError("MODEL_TIMEOUT", "连接 DeepSeek 网络超时。", reason_kind="timeout")
 
     if isinstance(error, (TimeoutError, APITimeoutError, httpx.TimeoutException)):
-        return ModelError("MODEL_TIMEOUT", "DeepSeek 响应超时。")
+        record("deepseek_api_error", exception_type=type(error).__name__, reason_kind="timeout", retryable=True)
+        return RetryableModelError("MODEL_TIMEOUT", "DeepSeek 响应超时。", reason_kind="timeout")
 
     if isinstance(error, AuthenticationError):
-        return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 认证失败，请检查 API Key。")
+        record("deepseek_api_error", exception_type=type(error).__name__, status_code=401, reason_kind="auth", retryable=False)
+        return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 认证失败（HTTP 401），请检查 API Key。")
 
-    if isinstance(error, (APIConnectionError, httpx.ConnectError)):
-        return ModelError("MODEL_UPSTREAM_ERROR", "无法连接 DeepSeek。")
+    if isinstance(error, (APIConnectionError, httpx.ConnectError, httpx.ReadError)):
+        record("deepseek_api_error", exception_type=type(error).__name__, reason_kind="network", retryable=True)
+        return RetryableModelError("MODEL_UPSTREAM_ERROR", "无法连接 DeepSeek 网络服务，请检查网络或代理设置。", reason_kind="network")
 
     if isinstance(error, APIStatusError):
-        if error.status_code in (408, 504):
-            return ModelError("MODEL_TIMEOUT", "DeepSeek 响应超时。")
-        return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 拒绝了本次请求。")
+        status = getattr(error, "status_code", None)
+        body_text = str(getattr(error, "body", "") or str(error)).lower()
+        if status == 401:
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=401, reason_kind="auth", retryable=False)
+            return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 认证失败（HTTP 401），请检查 API Key。")
+        if status == 402:
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=402, reason_kind="insufficient_balance", retryable=False)
+            return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 账户余额不足（HTTP 402），请检查账户额度。")
+        if status == 429:
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=429, reason_kind="rate_limit", retryable=True)
+            return RetryableModelError(
+                "MODEL_UPSTREAM_ERROR",
+                "DeepSeek 上游接口触发限流（HTTP 429），请稍后重试。",
+                reason_kind="rate_limit",
+                status_code=429,
+            )
+        if status in (408, 504):
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=status, reason_kind="timeout", retryable=True)
+            return RetryableModelError(
+                "MODEL_TIMEOUT",
+                f"DeepSeek 响应超时（HTTP {status}）。",
+                reason_kind="timeout",
+                status_code=status,
+            )
+        if status in (500, 502, 503):
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=status, reason_kind="server_error", retryable=True)
+            return RetryableModelError(
+                "MODEL_UPSTREAM_ERROR",
+                f"DeepSeek 服务端暂时不可用（HTTP {status}），请稍后重试。",
+                reason_kind="server_error",
+                status_code=status,
+            )
+        if status in (400, 422):
+            is_context_limit = any(hint in body_text for hint in _CONTEXT_LIMIT_HINTS)
+            reason = "context_length_exceeded" if is_context_limit else "invalid_request"
+            record("deepseek_api_error", exception_type="APIStatusError", status_code=status, reason_kind=reason, retryable=False)
+            if is_context_limit:
+                return ModelError(
+                    "MODEL_UPSTREAM_ERROR",
+                    f"当前对话上下文超过 DeepSeek 最大长度限制（HTTP {status}），请开启新会话或精简输入。",
+                )
+            return ModelError(
+                "MODEL_UPSTREAM_ERROR",
+                f"DeepSeek 拒绝了本次请求格式（HTTP {status}），请检查输入内容或参数后重试。",
+            )
+        record("deepseek_api_error", exception_type="APIStatusError", status_code=status, reason_kind="upstream_status", retryable=False)
+        return ModelError("MODEL_UPSTREAM_ERROR", f"DeepSeek 拒绝了本次请求（HTTP {status}）。")
 
+    record("deepseek_api_error", exception_type=type(error).__name__, reason_kind="unknown", retryable=False)
     return ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 调用失败或响应无效。")
 
 

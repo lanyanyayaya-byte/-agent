@@ -4,6 +4,7 @@ from typing import Literal
 
 ToolEvent = Literal["tool_started", "tool_completed", "tool_failed"]
 ToolSource = Literal["native", "mcp"]
+ToolCategory = Literal["skill", "workspace", "runtime"]
 
 ERROR_MESSAGES = {
     "VALIDATION_ERROR": "工具参数无效。",
@@ -17,6 +18,17 @@ ERROR_MESSAGES = {
     "RUN_CANCELLED": "工具调用已取消。",
     "RUN_TIMEOUT": "本轮对话执行总时长已超过上限。",
     "INTERNAL_ERROR": "无法完成工具调用。",
+    "SKILL_NOT_FOUND": "未找到指定的技能或该技能未在本轮启用。",
+    "SKILL_RESOURCE_NOT_FOUND": "未找到指定的技能资源文件。",
+    "SKILL_DEPENDENCY_MISSING": "技能运行依赖尚未就绪。",
+    "WORKSPACE_NOT_FOUND": "未找到工作区中的指定文件或目录。",
+    "WORKSPACE_PATH_INVALID": "工作区路径无效或超出当前工作目录范围。",
+    "WORKSPACE_EMPTY_ARTIFACT": "候选产物文件为空，无法发布。",
+    "RUNTIME_NON_ZERO_EXIT": "命令或脚本执行失败（非零退出码）。",
+    "RUNTIME_TIMEOUT": "命令或脚本执行超时。",
+    "RUNTIME_COMMAND_NOT_FOUND": "运行环境中未找到指定命令。",
+    "RUNTIME_PYTHON_NOT_READY": "独立 Python 运行环境尚未就绪。",
+    "SKILL_REPEAT_FAILURE_LIMIT": "同一可恢复错误连续重复达到上限，已停止自动重试。",
     "MCP_SERVER_UNAVAILABLE": "MCP 服务当前未连接或不可用。",
     "MCP_PERMISSION_DENIED": "MCP 工具未获得有效授权，或服务配置/工具定义已发生变化。",
     "MCP_TOOL_TIMEOUT": "MCP 工具调用超时，外部执行结果未知。",
@@ -32,10 +44,11 @@ ERROR_MESSAGES = {
 
 
 class ToolError(Exception):
-    def __init__(self, code: str, message: str | None = None):
+    def __init__(self, code: str, message: str | None = None, *, recoverable: bool = False):
         resolved = message or ERROR_MESSAGES.get(code, ERROR_MESSAGES["INTERNAL_ERROR"])
         super().__init__(resolved)
         self.code = code
+        self.recoverable = recoverable
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,7 @@ class ToolCall:
     server_name: str | None = None
     original_tool_name: str | None = None
     definition_hash: str | None = None
+    tool_category: ToolCategory | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +80,9 @@ class ToolResult:
     server_name: str | None = None
     original_tool_name: str | None = None
     duration_ms: int | None = None
+    tool_category: ToolCategory | None = None
+    recoverable: bool = False
+    error_signature: str | None = None
 
     @classmethod
     def failure(
@@ -74,17 +91,21 @@ class ToolResult:
         code: str,
         *,
         display_summary: str | None = None,
+        content: str | dict | None = None,
         source: ToolSource = "native",
         server_id: str | None = None,
         server_name: str | None = None,
         original_tool_name: str | None = None,
         duration_ms: int | None = None,
+        tool_category: ToolCategory | None = None,
+        recoverable: bool = False,
+        error_signature: str | None = None,
     ) -> "ToolResult":
         message = display_summary or ERROR_MESSAGES.get(code, ERROR_MESSAGES["INTERNAL_ERROR"])
         return cls(
             call_id,
             False,
-            None,
+            content,
             message,
             error_code=code,
             source=source,
@@ -92,6 +113,9 @@ class ToolResult:
             server_name=server_name,
             original_tool_name=original_tool_name,
             duration_ms=duration_ms,
+            tool_category=tool_category,
+            recoverable=recoverable,
+            error_signature=error_signature,
         )
 
     def for_model(self) -> str:

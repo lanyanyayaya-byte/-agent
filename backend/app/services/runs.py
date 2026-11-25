@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent.answer import EMPTY_CHECKPOINT_ID, AgentAnswer, answer_with_agent
+from app.agent.budgets import LEGACY_MAX_RUN_SECONDS, SKILLS_MAX_RUN_SECONDS
 from app.diagnostics import record
 from app.models import ModelError
 from app.services.grants import GrantRegistry
@@ -23,9 +24,14 @@ from app.tools.protocol import ERROR_MESSAGES, ToolEvent
 from app.tools.registry import RunToolSnapshot, RunTools
 
 if TYPE_CHECKING:
+    from app.runtime.executor import RuntimeExecutor
     from app.services.mcp import McpService
+    from app.skills.manager import SkillManager
+    from app.workspace.artifacts import ArtifactService
+    from app.workspace.service import WorkspaceService
 
-DEFAULT_MAX_RUN_SECONDS = 300.0
+DEFAULT_MAX_RUN_SECONDS = LEGACY_MAX_RUN_SECONDS
+DEFAULT_SKILLS_MAX_RUN_SECONDS = SKILLS_MAX_RUN_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +48,14 @@ class McpRunConfig:
     allow_external_data_egress: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SkillsRunConfig:
+    enabled: bool = False
+    selected_skill_ids: tuple[str, ...] = ()
+    attachment_ids: tuple[str, ...] = ()
+    artifact_ids: tuple[str, ...] = ()
+
+
 class RunServiceStopping(Exception):
     pass
 
@@ -53,7 +67,9 @@ class RunNotCancellable(Exception):
 @dataclass(frozen=True)
 class RunEvent:
     type: Literal[
-        "run_started", "message_delta", "run_ citations", "run_citations", "run_completed", "error", "run_cancelled",
+        "run_started", "message_delta", "run_citations",
+        "skill_activated", "artifact_created",
+        "run_completed", "error", "run_cancelled",
     ] | ToolEvent
     data: dict[str, Any]
     ts: str = field(default_factory=utc_now)
@@ -87,6 +103,9 @@ class RunStream:
             self.observed_text.clear()
         self.publish(RunEvent(event, data))
 
+    def on_custom_event(self, event_type: str, data: dict[str, Any]) -> None:
+        self.publish(RunEvent(event_type, data))  # type: ignore[arg-type]
+
 
 
 @dataclass
@@ -104,6 +123,7 @@ class RunService:
         grants: GrantRegistry,
         *,
         max_run_seconds: float = DEFAULT_MAX_RUN_SECONDS,
+        skills_max_run_seconds: float = DEFAULT_SKILLS_MAX_RUN_SECONDS,
         mcp_tool_timeout_seconds: float | None = None,
     ):
         self._store = store
@@ -111,7 +131,12 @@ class RunService:
         self._grants = grants
         self.knowledge_qa: KnowledgeQAService | None = None
         self.mcp_service: McpService | None = None
+        self.workspace_service: WorkspaceService | None = None
+        self.artifact_service: ArtifactService | None = None
+        self.runtime_executor: RuntimeExecutor | None = None
+        self.skill_manager: SkillManager | None = None
         self._max_run_seconds = max_run_seconds
+        self._skills_max_run_seconds = skills_max_run_seconds
         self._mcp_tool_timeout_seconds = mcp_tool_timeout_seconds
         self._checkpointer: AsyncSqliteSaver | None = None
         self._stopping = False
@@ -141,6 +166,8 @@ class RunService:
     async def delete_session(self, session_id: str) -> None:
         self._require_running()
         await asyncio.to_thread(self._store.delete_session, session_id)
+        if self.workspace_service is not None:
+            await asyncio.to_thread(self.workspace_service.delete_session_workspace, session_id)
 
     async def get_run(self, run_id: str) -> RunStatus:
         return await asyncio.to_thread(self._store.get_run, run_id)
@@ -152,11 +179,12 @@ class RunService:
         self, session_id: str, client_request_id: str, message: str, *, request_id: str,
         knowledge: KnowledgeRunConfig | None = None,
         mcp: McpRunConfig | None = None,
+        skills: SkillsRunConfig | None = None,
     ) -> RunStream:
         self._require_running()
         accepted = asyncio.get_running_loop().create_future()
         worker = asyncio.create_task(
-            self._run(session_id, client_request_id, message, accepted, request_id, knowledge, mcp),
+            self._run(session_id, client_request_id, message, accepted, request_id, knowledge, mcp, skills),
         )
         self._workers.add(worker)
         worker.add_done_callback(self._workers.discard)
@@ -214,8 +242,13 @@ class RunService:
         stream: RunStream,
         knowledge: KnowledgeRunConfig | None = None,
     ) -> AgentAnswer:
+        timeout_s = (
+            self._skills_max_run_seconds
+            if (stream.tool_snapshot is not None and stream.tool_snapshot.has_skills_tools)
+            else self._max_run_seconds
+        )
         try:
-            async with asyncio.timeout(self._max_run_seconds):
+            async with asyncio.timeout(timeout_s):
                 return await self._answer_inner(run, message, stream, knowledge, stream.tool_snapshot)
         except TimeoutError:
             raise ModelError("RUN_TIMEOUT", ERROR_MESSAGES["RUN_TIMEOUT"]) from None
@@ -298,6 +331,11 @@ class RunService:
             run,
             stream.on_tool_event,
             mcp_service=self.mcp_service,
+            skill_manager=self.skill_manager,
+            workspace_service=self.workspace_service,
+            artifact_service=self.artifact_service,
+            runtime_executor=self.runtime_executor,
+            emit_run_event=stream.on_custom_event,
             snapshot=tool_snapshot,
             mcp_tool_timeout_seconds=self._mcp_tool_timeout_seconds,
         )
@@ -323,9 +361,11 @@ class RunService:
     async def _run(
         self, session_id: str, client_request_id: str, message: str, accepted: asyncio.Future[RunStream],
         request_id: str, knowledge: KnowledgeRunConfig | None = None, mcp: McpRunConfig | None = None,
+        skills: SkillsRunConfig | None = None,
     ) -> None:
         # The service owns admission and execution even if the requesting HTTP task disappears.
         mcp_cfg = mcp or McpRunConfig(enabled=False, allow_external_data_egress=False)
+        skills_cfg = skills or SkillsRunConfig(enabled=False)
         try:
             async with self._transitions:
                 self._require_running()
@@ -346,6 +386,11 @@ class RunService:
                             allow_external_data_egress=mcp_cfg.allow_external_data_egress,
                             knowledge_enabled=knowledge is not None,
                             session_egress_risk=session_egress_risk,
+                            skill_manager=self.skill_manager,
+                            skills_enabled=skills_cfg.enabled,
+                            selected_skill_ids=skills_cfg.selected_skill_ids or None,
+                            attachment_ids=skills_cfg.attachment_ids,
+                            artifact_ids=skills_cfg.artifact_ids,
                         )
                     except ModelError as err:
                         precheck_error = err
@@ -434,7 +479,17 @@ class RunService:
             except Exception:
                 return await self._fail(run, "INTERNAL_ERROR", "无法完成本次生成。")
             if message_id is not None:
-                return RunEvent("run_completed", {"message_id": message_id})
+                completed_data: dict[str, Any] = {"message_id": message_id}
+                if self.artifact_service is not None:
+                    published_arts = await asyncio.to_thread(
+                        self.artifact_service.list_artifacts,
+                        run.session_id,
+                        run_id=run.run_id,
+                        include_non_published=False,
+                    )
+                    if published_arts:
+                        completed_data["artifacts"] = [asdict(a) for a in published_arts]
+                return RunEvent("run_completed", completed_data)
             # A cancellation accepted while the model was still active can win the database race.
             if await asyncio.to_thread(self._store.confirm_cancel, run):
                 return RunEvent("run_cancelled", {"reason": "user_requested"})

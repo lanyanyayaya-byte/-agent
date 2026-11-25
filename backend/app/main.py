@@ -23,12 +23,17 @@ from app.api.index_jobs import index_job_router, index_management_router
 from app.api.knowledge_search import knowledge_search_router
 from app.api.library import library_router
 from app.api.mcp import mcp_router
+from app.api.runtime import runtime_router
+from app.api.skills import skills_router
+from app.api.workspace import workspace_router
 from app.diagnostics import record
 from app.mcp.manager import McpManager
 from app.mcp.process_registry import McpProcessRegistry
 from app.models import ModelError
 from app.models.deepseek import DEEPSEEK_BASE_URL
 from app.models.siliconflow import EMBEDDING_MODEL, MAX_BATCH_SIZE, SiliconFlowEmbedding
+from app.runtime.executor import RuntimeExecutor
+from app.runtime.manager import RuntimeManager
 from app.security import ApiError, require_bearer, validate_tokens
 from app.services.citation_resolver import CitationResolver
 from app.services.document_embeddings import DocumentEmbeddingService
@@ -42,6 +47,9 @@ from app.services.grants import GrantRegistry
 from app.services.library import LibraryService, log_maintenance_failure
 from app.services.models import ModelService
 from app.services.runs import RunService
+from app.skills.installer import SkillInstaller
+from app.skills.manager import SkillManager
+from app.storage.artifacts import WorkspaceArtifactStore
 from app.storage.business import DATABASE_NAME, BusinessStore, DatabaseLockedError
 from app.storage.checkpoints import CHECKPOINT_DATABASE_NAME
 from app.storage.chunks import ChunkStore
@@ -49,6 +57,9 @@ from app.storage.index_jobs import IndexJobStore
 from app.storage.library import KnowledgeStore, KnowledgeStoreError
 from app.storage.mcp import McpStore
 from app.storage.parsed_documents import ParsedDocumentStore
+from app.storage.skills import SkillStore
+from app.workspace.artifacts import ArtifactService
+from app.workspace.service import WorkspaceService
 
 DEV_ORIGIN = "http://127.0.0.1:1420"
 MACOS_APP_ORIGIN = "tauri://localhost"
@@ -190,6 +201,27 @@ def create_app(
             application.state.mcp_manager = mcp_manager
             application.state.mcp_service = mcp_service
             runs.mcp_service = mcp_service
+            workspace_store = WorkspaceArtifactStore(store)
+            workspace_service = WorkspaceService(database_path.parent, workspace_store)
+            artifact_service = ArtifactService(workspace_service, workspace_store)
+            runtime_manager = RuntimeManager(database_path.parent)
+            runtime_executor = RuntimeExecutor(runtime_manager)
+            skill_store = SkillStore(store)
+            skill_manager = SkillManager(database_path.parent, skill_store, runtime_manager)
+            skill_installer = SkillInstaller(skill_manager, runtime_manager)
+            await asyncio.to_thread(skill_manager.sync_builtin_skills)
+            application.state.workspace_store = workspace_store
+            application.state.workspace_service = workspace_service
+            application.state.artifact_service = artifact_service
+            application.state.runtime_manager = runtime_manager
+            application.state.runtime_executor = runtime_executor
+            application.state.skill_store = skill_store
+            application.state.skill_manager = skill_manager
+            application.state.skill_installer = skill_installer
+            runs.workspace_service = workspace_service
+            runs.artifact_service = artifact_service
+            runs.runtime_executor = runtime_executor
+            runs.skill_manager = skill_manager
             try:
                 knowledge_store = await asyncio.to_thread(KnowledgeStore, database_path.parent)
                 library = await asyncio.to_thread(LibraryService, knowledge_store, instance_id)
@@ -235,11 +267,23 @@ def create_app(
             finally:
                 stop_background.set()
                 runs.mcp_service = None
+                runs.workspace_service = None
+                runs.artifact_service = None
+                runs.runtime_executor = None
+                runs.skill_manager = None
                 if mcp_service is not None:
                     await mcp_service.shutdown()
                 application.state.mcp_store = None
                 application.state.mcp_manager = None
                 application.state.mcp_service = None
+                application.state.workspace_store = None
+                application.state.workspace_service = None
+                application.state.artifact_service = None
+                application.state.runtime_manager = None
+                application.state.runtime_executor = None
+                application.state.skill_store = None
+                application.state.skill_manager = None
+                application.state.skill_installer = None
                 if worker_task is not None:
                     await worker_task
                 runs.knowledge_qa = None
@@ -275,6 +319,14 @@ def create_app(
     app.state.mcp_store = None
     app.state.mcp_manager = None
     app.state.mcp_service = None
+    app.state.workspace_store = None
+    app.state.workspace_service = None
+    app.state.artifact_service = None
+    app.state.runtime_manager = None
+    app.state.runtime_executor = None
+    app.state.skill_store = None
+    app.state.skill_manager = None
+    app.state.skill_installer = None
     app.state.runs = runs
 
     @app.exception_handler(ApiError)
@@ -367,6 +419,9 @@ def create_app(
     app.include_router(index_job_router(HOST_NAMESPACE, require_ready))
     app.include_router(index_management_router(require_ui, require_ready))
     app.include_router(mcp_router(HOST_NAMESPACE, require_ui, require_ready))
+    app.include_router(workspace_router(HOST_NAMESPACE, require_ui, require_ready))
+    app.include_router(runtime_router(HOST_NAMESPACE, require_ui, require_ready))
+    app.include_router(skills_router(HOST_NAMESPACE, require_ui, require_ready))
 
     @app.get("/api/v1/status", dependencies=[Depends(require_ui)])
     async def status(response: Response) -> Status:

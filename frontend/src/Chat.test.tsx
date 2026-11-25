@@ -6,7 +6,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { connectApiClient, type Message, type RunState, type RunSummary, type SessionSummary } from './api/apiClient';
 import Chat from './Chat';
 
-vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn(() => false) }));
 
 afterEach(() => {
   cleanup();
@@ -67,11 +67,12 @@ async function setup() {
       expect(options.method).toBe('POST');
       return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
     }
-    const history = path.match(/^\/sessions\/([^/]+)\/(messages|runs|grants)$/);
+    const history = path.match(/^\/sessions\/([^/]+)\/(messages|runs|grants|workspace)$/);
     if (history) {
       const [, sessionId, kind] = history;
       if (kind === 'messages') return Response.json(messages.filter((row) => row.session_id === sessionId));
       if (kind === 'grants') return Response.json([]);
+      if (kind === 'workspace') return Response.json({ session_id: sessionId, files: [], artifacts: [] });
       const items = runs.filter((row) => row.session_id === sessionId);
       return Response.json(searchParams.has('cursor')
         ? { items: items.slice(1), next_cursor: null }

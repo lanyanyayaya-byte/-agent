@@ -8,6 +8,8 @@ mod library;
 mod mcp;
 mod mcp_process;
 mod sidecar;
+mod skills;
+mod workspace;
 
 use serde::Serialize;
 use tauri::{Manager, RunEvent};
@@ -108,9 +110,30 @@ fn main() {
             mcp::mcp_disconnect_server,
             mcp::mcp_refresh_tools,
             mcp::mcp_set_server_enabled,
-            mcp::mcp_set_tool_permission
+            mcp::mcp_set_tool_permission,
+            workspace::select_and_import_workspace_file,
+            workspace::select_and_import_workspace_files,
+            workspace::import_dropped_workspace_files,
+            workspace::delete_workspace_file,
+            workspace::open_artifact,
+            workspace::reveal_artifact_in_finder,
+            workspace::export_artifact,
+            workspace::runtime_prepare,
+            skills::skills_preview_github,
+            skills::skills_pick_and_preview_local,
+            skills::skills_install_from_preview,
+            skills::skills_set_enabled,
+            skills::skills_update,
+            skills::skills_prepare,
+            skills::skills_delete
         ])
         .setup(|app| {
+            #[cfg(all(dev, debug_assertions))]
+            let app_data_dir = std::env::var_os("KNOWLEDGEAGENT_DEV_DATA_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app.path().app_data_dir()?);
+            #[cfg(not(all(dev, debug_assertions)))]
             let app_data_dir = app.path().app_data_dir()?;
             app.manage(diagnostics::HostLog::new(&app_data_dir));
             #[cfg(target_os = "macos")]

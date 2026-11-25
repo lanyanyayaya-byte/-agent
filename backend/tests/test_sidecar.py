@@ -312,7 +312,7 @@ raise SystemExit(main())
         assert_clean_exit(child, payload)
 
     with closing(sqlite3.connect(tmp_path / DATABASE_NAME)) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (6,)
+        assert db.execute("PRAGMA user_version").fetchone() == (len(BusinessStore._migrations) if hasattr(BusinessStore, "_migrations") else 7,)
         assert db.execute("SELECT name FROM sqlite_master WHERE name = 'v5_canary'").fetchone() is None
         assert db.execute("SELECT session_id, title FROM sessions").fetchall() == [(session_id, "升级并发保护")]
 
@@ -354,7 +354,7 @@ raise SystemExit(main())
     assert failed.returncode == 3 and not failed.stdout
 
     with closing(sqlite3.connect(tmp_path / DATABASE_NAME)) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (6,)
+        assert db.execute("PRAGMA user_version").fetchone() == (len(BusinessStore._migrations) if hasattr(BusinessStore, "_migrations") else 7,)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("SELECT name FROM sqlite_master WHERE name = 'transient_upgrade_table'").fetchone() is None
         assert db.execute("SELECT * FROM sessions").fetchall() == before_sessions

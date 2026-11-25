@@ -1,8 +1,16 @@
+import { isTauri } from '@tauri-apps/api/core';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import {
   ApiRequestError,
+  deleteWorkspaceFile,
+  exportArtifact,
+  importDroppedWorkspaceFiles,
   isTerminal,
   mcpErrorMessage,
+  openArtifact,
+  revealArtifactInFinder,
+  selectAndImportWorkspaceFiles,
   type ApiClient,
   type CoverageMode,
   type DocumentSummary,
@@ -13,10 +21,15 @@ import {
   type RunState,
   type RunSummary,
   type SessionSummary,
+  type SessionWorkspaceView,
+  type SkillView,
+  type StoredArtifact,
   type StoredCitation,
+  type StoredSkillActivation,
   type ToolCallSummary,
+  type WorkspaceFileView,
 } from './api/apiClient';
-import type { RunEvent, ToolSource } from './api/chatEvents';
+import type { ArtifactSummary, RunEvent, ToolCategory, ToolSource } from './api/chatEvents';
 import GrantPanel from './GrantPanel';
 import MarkdownAnswer from './MarkdownAnswer';
 
@@ -24,6 +37,8 @@ const MESSAGE_LIMIT = 20_000;
 const POLL_INTERVAL_MS = 1000;
 const SELECTED_SESSION_KEY = 'knowledgeagent.selected_session';
 const MCP_ENABLED_STORAGE_KEY = 'knowledgeagent.mcp_enabled';
+const SKILLS_ENABLED_STORAGE_KEY = 'knowledgeagent.skills_enabled';
+const SKILLS_MODE_STORAGE_KEY = 'knowledgeagent.skills_mode';
 const DEFAULT_SESSION_TITLE = /^(?:新对话|会话\s*\d+)$/;
 const TITLE_FILLER_PREFIX =
   /^(?:你好(?:呀|啊)?[，,！!。.\s]*|请问一下|请问|请教一下|请教|请帮我|帮我|给我|能否|可以|麻烦|详细讲解一下|深入讲解一下|讲解一下|详细讲解|讲解|讲讲|讲一下|谈谈|说说|详细解释一下|解释一下|请解释|总结一下|请总结|介绍一下|请介绍|分析一下|推导一下|证明一下|梳理一下|对比不同教材中(?:关于)?|不同教材中(?:关于)?|告诉我|什么是|如何理解|怎么理解|关于)+\s*/;
@@ -52,12 +67,15 @@ type ToolProgress = {
   summary?: string;
   errorCode?: string;
   source?: ToolSource;
+  toolCategory?: ToolCategory | null;
+  recoverable?: boolean;
   serverId?: string;
   serverName?: string;
   originalToolName?: string;
   durationMs?: number;
 };
 type ToolEvent = Extract<RunEvent, { type: 'tool_started' | 'tool_completed' | 'tool_failed' }>;
+type ActivatedSkillBadge = { skill_id: string; name: string; revision?: string };
 
 type EgressPrompt = {
   sessionId: string;
@@ -87,6 +105,8 @@ type Conversation = Pick<SessionSummary, 'session_id' | 'title'> & {
   activeRunId?: string;
   activeStatus?: RunState;
   toolsByRun?: Record<string, ToolProgress[]>;
+  skillsByRun?: Record<string, ActivatedSkillBadge[]>;
+  artifactsByRun?: Record<string, ArtifactSummary[]>;
   citationsByRun?: Record<string, StoredCitation[]>;
   live?: LiveTurn;
   submittingError?: string;
@@ -157,6 +177,63 @@ function readInitialMcpEnabled(): boolean {
   }
 }
 
+function readInitialSkillsEnabled(): boolean {
+  try {
+    return localStorage.getItem(SKILLS_ENABLED_STORAGE_KEY) !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+function readInitialSkillsMode(): 'auto' | 'manual' {
+  try {
+    return localStorage.getItem(SKILLS_MODE_STORAGE_KEY) === 'manual' ? 'manual' : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function isPreviewableImage(mediaType: string): boolean {
+  return ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp', 'image/gif'].includes(
+    mediaType.toLowerCase().split(';')[0].trim(),
+  );
+}
+
+function fileIcon(filename: string, mediaType = ''): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.docx') || lower.endsWith('.doc')) return '📝';
+  if (lower.endsWith('.xlsx') || lower.endsWith('.xls') || lower.endsWith('.csv')) return '📊';
+  if (lower.endsWith('.pdf')) return '📑';
+  if (lower.endsWith('.pptx')) return '📽️';
+  if (lower.endsWith('.mmd') || lower.endsWith('.mermaid')) return '🗺️';
+  if (isPreviewableImage(mediaType) || /\.(png|jpe?g|svg|webp|gif)$/.test(lower)) return '🖼️';
+  if (lower.endsWith('.md') || lower.endsWith('.txt')) return '📄';
+  return '📦';
+}
+
+function fileTypeLabel(filename: string, mediaType = ''): string {
+  const lower = filename.toLowerCase();
+  const ext = lower.includes('.') ? lower.slice(lower.lastIndexOf('.') + 1).toUpperCase() : '';
+  if (ext === 'DOCX') return 'Word 文档';
+  if (ext === 'XLSX') return 'Excel 表格';
+  if (ext === 'PDF') return 'PDF 文档';
+  if (ext === 'PPTX') return '演示文稿';
+  if (ext === 'MMD') return 'Mermaid 导图';
+  if (ext === 'SVG') return 'SVG 矢量图';
+  if (ext === 'PNG' || ext === 'JPG' || ext === 'JPEG') return `${ext} 图片`;
+  if (ext === 'CSV') return 'CSV 数据';
+  if (ext === 'MD') return 'Markdown';
+  if (ext) return ext;
+  return mediaType || '文件';
+}
+
 function inspectHistoricalContextRisk(turns?: Turn[]) {
   let historicalRagRisk = false;
   let historicalFileRisk = false;
@@ -191,6 +268,7 @@ function toolProgress(previous: ToolProgress[], event: ToolEvent): ToolProgress[
         name: event.data.tool_name,
         state: 'running',
         source: event.data.source,
+        toolCategory: event.data.tool_category ?? undefined,
         serverId: event.data.server_id ?? undefined,
         serverName: event.data.server_name ?? undefined,
         originalToolName: event.data.original_tool_name ?? undefined,
@@ -200,6 +278,7 @@ function toolProgress(previous: ToolProgress[], event: ToolEvent): ToolProgress[
   const summary = event.type === 'tool_completed' ? event.data.summary : event.data.message;
   const state = event.type === 'tool_completed' ? 'completed' : event.data.code === 'RUN_CANCELLED' ? 'cancelled' : 'failed';
   const errorCode = event.type === 'tool_failed' ? event.data.code : undefined;
+  const recoverable = event.type === 'tool_failed' ? Boolean(event.data.recoverable) : undefined;
   return previous.map((tool) => {
     if (tool.id !== id || tool.state !== 'running') return tool;
     return {
@@ -207,7 +286,9 @@ function toolProgress(previous: ToolProgress[], event: ToolEvent): ToolProgress[
       state,
       summary,
       errorCode,
+      recoverable,
       source: event.data.source ?? tool.source,
+      toolCategory: event.data.tool_category ?? tool.toolCategory,
       serverId: event.data.server_id ?? tool.serverId,
       serverName: event.data.server_name ?? tool.serverName,
       originalToolName: event.data.original_tool_name ?? tool.originalToolName,
@@ -216,40 +297,256 @@ function toolProgress(previous: ToolProgress[], event: ToolEvent): ToolProgress[
   });
 }
 
-function ToolActivity({ tools, status }: { tools?: ToolProgress[]; status?: RunState }) {
-  if (!tools?.length) return null;
+function toolCategoryBadge(category?: ToolCategory | null): string | null {
+  if (category === 'skill') return 'Skill';
+  if (category === 'workspace') return 'Workspace';
+  if (category === 'runtime') return 'Runtime';
+  return null;
+}
+
+function ToolActivity({
+  tools,
+  skills,
+  status,
+}: {
+  tools?: ToolProgress[];
+  skills?: ActivatedSkillBadge[];
+  status?: RunState;
+}) {
+  const hasManyCompleted = Boolean(tools && tools.length >= 3 && status && isTerminal(status));
+  const [expanded, setExpanded] = useState<boolean>();
+  if (!tools?.length && !skills?.length) return null;
+  const isOpen = expanded ?? !hasManyCompleted;
+  const recoverableCount = tools?.filter((t) => t.state === 'failed' && t.recoverable).length ?? 0;
+
   return (
-    <ul className="tool-activity" aria-label="工具执行">
-      {tools.map((tool) => {
-        const stateText = tool.state === 'running'
-          ? (status && isTerminal(status) ? '执行已中断' : '执行中')
-          : { completed: '已完成', failed: '执行失败', cancelled: '已取消' }[tool.state];
-        if (tool.source === 'mcp') {
-          const duration = formatDuration(tool.durationMs);
+    <div className="run-activity-wrap">
+      {skills && skills.length > 0 && (
+        <div className="activated-skills-row" aria-label="已激活技能">
+          {skills.map((sk) => (
+            <span key={sk.skill_id} className="activated-skill-pill">
+              🧩 {sk.name}
+            </span>
+          ))}
+        </div>
+      )}
+      {tools && tools.length > 0 && (
+        <>
+          {hasManyCompleted && (
+            <button
+              type="button"
+              className="activity-collapse-toggle"
+              aria-expanded={isOpen}
+              onClick={() => setExpanded(!isOpen)}>
+              <span>
+                {isOpen ? '▾' : '▸'} 执行过程（{tools.length} 步
+                {recoverableCount > 0 ? `，含 ${recoverableCount} 次可恢复修正` : ''}）
+              </span>
+            </button>
+          )}
+          {isOpen && (
+            <ul className="tool-activity" aria-label="工具执行">
+              {tools.map((tool) => {
+                const isRecoverableFailure = tool.state === 'failed' && tool.recoverable;
+                const stateText = tool.state === 'running'
+                  ? (status && isTerminal(status) ? '执行已中断' : '执行中')
+                  : isRecoverableFailure
+                    ? '可恢复错误 · 继续修正'
+                    : { completed: '已完成', failed: '执行失败', cancelled: '已取消' }[tool.state];
+                const duration = formatDuration(tool.durationMs);
+                if (tool.source === 'mcp') {
+                  return (
+                    <li key={tool.id} role="status" className="tool-activity-mcp" data-state={tool.state} data-source="mcp">
+                      <span className="tool-source-badge">MCP</span>
+                      {tool.serverName && <span className="tool-server-name">{tool.serverName}</span>}
+                      <span className="tool-name">{tool.originalToolName || tool.name}</span>
+                      {' · '}
+                      <span className={`tool-state-label state-${tool.state}`}>{stateText}</span>
+                      {duration && <span className="tool-duration"> · {duration}</span>}
+                      {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
+                      {tool.state === 'failed' && tool.errorCode && (
+                        <code className="tool-error-code">{tool.errorCode}</code>
+                      )}
+                    </li>
+                  );
+                }
+                const catBadge = toolCategoryBadge(tool.toolCategory);
+                return (
+                  <li
+                    key={tool.id}
+                    role="status"
+                    className={`${isRecoverableFailure ? 'tool-recoverable' : ''} ${catBadge ? `tool-cat-${tool.toolCategory}` : ''}`.trim()}
+                    data-state={tool.state}>
+                    {catBadge && <span className={`tool-cat-badge cat-${tool.toolCategory}`}>{catBadge}</span>}
+                    <span className="tool-name">{tool.name}</span>{' · '}
+                    <span className={isRecoverableFailure ? 'tool-recoverable-label' : ''}>{stateText}</span>
+                    {duration && <span className="tool-duration"> · {duration}</span>}
+                    {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ArtifactImagePreview({
+  client,
+  sessionId,
+  artifactId,
+  filename,
+}: {
+  client: ApiClient;
+  sessionId: string;
+  artifactId: string;
+  filename: string;
+}) {
+  const [blobUrl, setBlobUrl] = useState<string>();
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!client.fetchArtifactBlob) return;
+    const controller = new AbortController();
+    let objectUrl: string | undefined;
+    setFailed(false);
+    void client.fetchArtifactBlob(sessionId, artifactId, controller.signal).then((blob) => {
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      setBlobUrl(objectUrl);
+    }).catch(() => {
+      if (!controller.signal.aborted) setFailed(true);
+    });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [client, sessionId, artifactId]);
+
+  if (failed || !blobUrl) return null;
+  return (
+    <div className="artifact-image-wrap">
+      <img src={blobUrl} alt={filename} className="artifact-preview-img" />
+    </div>
+  );
+}
+
+function TurnArtifacts({
+  client,
+  sessionId,
+  artifacts,
+  onContinueEdit,
+}: {
+  client?: ApiClient;
+  sessionId: string;
+  artifacts?: ArtifactSummary[];
+  onContinueEdit?: (artifact: ArtifactSummary) => void;
+}) {
+  const [actionNotice, setActionNotice] = useState('');
+  const [busyId, setBusyId] = useState<string>();
+
+  const visible = artifacts?.filter((a) => a.status !== 'discarded') ?? [];
+  if (visible.length === 0) return null;
+
+  async function runAction(artifact: ArtifactSummary, kind: 'open' | 'reveal' | 'export') {
+    if (busyId) return;
+    setBusyId(artifact.artifact_id);
+    setActionNotice('');
+    try {
+      if (kind === 'open') {
+        await openArtifact(sessionId, artifact.artifact_id);
+      } else if (kind === 'reveal') {
+        await revealArtifactInFinder(sessionId, artifact.artifact_id);
+      } else {
+        const res = await exportArtifact(sessionId, artifact.artifact_id);
+        if (res?.exported) setActionNotice(`已另存为：${res.filename}`);
+      }
+    } catch (err) {
+      setActionNotice(mcpErrorMessage(err, '操作文件产物失败，请确认文件存在。'));
+    } finally {
+      setBusyId(undefined);
+    }
+  }
+
+  return (
+    <section className="turn-artifacts" aria-label="生成的文件产物">
+      <div className="turn-artifacts-header">
+        <strong>文件产物（{visible.length}）</strong>
+        {actionNotice && <span className="artifact-action-notice">{actionNotice}</span>}
+      </div>
+      <div className="artifact-card-grid">
+        {visible.map((artifact) => {
+          const isPublished = artifact.status === 'published';
+          const missing = artifact.file_exists === false;
+          const isBusy = busyId === artifact.artifact_id;
           return (
-            <li key={tool.id} role="status" className="tool-activity-mcp" data-state={tool.state} data-source="mcp">
-              <span className="tool-source-badge">MCP</span>
-              {tool.serverName && <span className="tool-server-name">{tool.serverName}</span>}
-              <span className="tool-name">{tool.originalToolName || tool.name}</span>
-              {' · '}
-              <span className={`tool-state-label state-${tool.state}`}>{stateText}</span>
-              {duration && <span className="tool-duration"> · {duration}</span>}
-              {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
-              {tool.state === 'failed' && tool.errorCode && (
-                <code className="tool-error-code">{tool.errorCode}</code>
+            <div key={artifact.artifact_id} className={`artifact-card ${missing ? 'is-missing' : ''}`}>
+              <div className="artifact-card-head">
+                <span className="artifact-icon" aria-hidden="true">
+                  {fileIcon(artifact.filename, artifact.media_type)}
+                </span>
+                <div className="artifact-info">
+                  <div className="artifact-name-row">
+                    <strong className="artifact-filename" title={artifact.filename}>{artifact.filename}</strong>
+                    <span className="artifact-type-badge">{fileTypeLabel(artifact.filename, artifact.media_type)}</span>
+                    {!isPublished && <span className="artifact-status-badge">暂存中</span>}
+                    {missing && <span className="artifact-status-badge missing">文件已移除</span>}
+                  </div>
+                  <span className="artifact-meta">
+                    {formatBytes(artifact.size_bytes)}
+                    {artifact.title && artifact.title !== artifact.filename ? ` · ${artifact.title}` : ''}
+                  </span>
+                </div>
+                {isPublished && !missing && (
+                  <div className="artifact-actions">
+                    <button
+                      type="button"
+                      className="artifact-btn primary"
+                      disabled={isBusy}
+                      onClick={() => void runAction(artifact, 'open')}>
+                      打开
+                    </button>
+                    <button
+                      type="button"
+                      className="artifact-btn"
+                      disabled={isBusy}
+                      onClick={() => void runAction(artifact, 'reveal')}>
+                      Finder
+                    </button>
+                    <button
+                      type="button"
+                      className="artifact-btn"
+                      disabled={isBusy}
+                      onClick={() => void runAction(artifact, 'export')}>
+                      另存为
+                    </button>
+                    {onContinueEdit && (
+                      <button
+                        type="button"
+                        className="artifact-btn"
+                        disabled={isBusy}
+                        onClick={() => onContinueEdit(artifact)}>
+                        继续编辑
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+              {client && isPublished && !missing && isPreviewableImage(artifact.media_type) && (
+                <ArtifactImagePreview
+                  client={client}
+                  sessionId={sessionId}
+                  artifactId={artifact.artifact_id}
+                  filename={artifact.filename}
+                />
               )}
-            </li>
+            </div>
           );
-        }
-        return (
-          <li key={tool.id} role="status" data-state={tool.state}>
-            <span className="tool-name">{tool.name}</span>{' · '}
-            {stateText}
-            {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
-          </li>
-        );
-      })}
-    </ul>
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -263,11 +560,31 @@ function resolveTurnTools(liveTools?: ToolProgress[], savedTools?: ToolCallSumma
     summary: tc.summary ?? undefined,
     errorCode: tc.error_code ?? undefined,
     source: tc.source,
+    toolCategory: tc.tool_category ?? undefined,
+    recoverable: tc.recoverable,
     serverId: tc.server_id ?? undefined,
     serverName: tc.server_name ?? undefined,
     originalToolName: tc.original_tool_name ?? undefined,
     durationMs: typeof tc.duration_ms === 'number' ? tc.duration_ms : undefined,
   }));
+}
+
+function resolveTurnSkills(
+  liveSkills?: ActivatedSkillBadge[],
+  savedSkills?: StoredSkillActivation[],
+): ActivatedSkillBadge[] | undefined {
+  if (liveSkills?.length) return liveSkills;
+  if (!savedSkills?.length) return undefined;
+  return savedSkills.map((s) => ({ skill_id: s.skill_id, name: s.name_snapshot, revision: s.revision }));
+}
+
+function resolveTurnArtifacts(
+  liveArtifacts?: ArtifactSummary[],
+  savedArtifacts?: StoredArtifact[],
+): ArtifactSummary[] | undefined {
+  if (savedArtifacts?.length) return savedArtifacts;
+  if (liveArtifacts?.length) return liveArtifacts;
+  return undefined;
 }
 
 function CitationStatusTag({ citation }: { citation: StoredCitation }) {
@@ -402,6 +719,8 @@ export default function Chat({
   autoTitleSessions = false,
   mcpSummary,
   onOpenMcpPanel,
+  skills,
+  onOpenSkillsPanel,
 }: {
   client?: ApiClient;
   modelConfigured: boolean;
@@ -410,6 +729,8 @@ export default function Chat({
   autoTitleSessions?: boolean;
   mcpSummary?: McpSummary | null;
   onOpenMcpPanel?: () => void;
+  skills?: SkillView[];
+  onOpenSkillsPanel?: () => void;
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<string>();
@@ -438,10 +759,23 @@ export default function Chat({
   const [egressPrompt, setEgressPrompt] = useState<EgressPrompt>();
   const [grantsOpen, setGrantsOpen] = useState(false);
   const [scopeOpen, setScopeOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceBySession, setWorkspaceBySession] = useState<Record<string, SessionWorkspaceView>>({});
+  const [pendingAttachmentsBySession, setPendingAttachmentsBySession] = useState<Record<string, string[]>>({});
+  const [referencedArtifactsBySession, setReferencedArtifactsBySession] = useState<Record<string, ArtifactSummary[]>>({});
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [attachmentError, setAttachmentError] = useState('');
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [skillsEnabled, setSkillsEnabled] = useState<boolean>(readInitialSkillsEnabled);
+  const [skillsMode, setSkillsMode] = useState<'auto' | 'manual'>(readInitialSkillsMode);
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
   const turnsEndRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const activeSessionIdRef = useRef<string | undefined>(undefined);
 
   const effectiveMcpSummary = mcpSummary === undefined ? localMcpSummary : (mcpSummary ?? undefined);
+  const enabledSkills = (skills ?? []).filter((s) => s.enabled);
 
   const handleGrantsChange = useCallback((sid: string, grants: FileGrant[]) => {
     setGrantsBySession((prev) => ({ ...prev, [sid]: grants }));
@@ -451,6 +785,25 @@ export default function Chat({
     setMcpEnabled(next);
     try {
       localStorage.setItem(MCP_ENABLED_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage quota/access errors.
+    }
+  }
+
+  function toggleSkillsEnabled(next: boolean) {
+    setSkillsEnabled(next);
+    if (!next) setSkillsPickerOpen(false);
+    try {
+      localStorage.setItem(SKILLS_ENABLED_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage quota/access errors.
+    }
+  }
+
+  function changeSkillsMode(next: 'auto' | 'manual') {
+    setSkillsMode(next);
+    try {
+      localStorage.setItem(SKILLS_MODE_STORAGE_KEY, next);
     } catch {
       // Ignore storage quota/access errors.
     }
@@ -503,7 +856,128 @@ export default function Chat({
 
   useEffect(() => {
     setEgressPrompt(undefined);
+    setAttachmentError('');
+    activeSessionIdRef.current = sessionId;
   }, [sessionId]);
+
+  const refreshWorkspace = useCallback(async (sid: string, signal?: AbortSignal) => {
+    if (!client?.getSessionWorkspace) return;
+    try {
+      const ws = await client.getSessionWorkspace(sid, signal ?? new AbortController().signal);
+      if (!signal?.aborted) {
+        setWorkspaceBySession((prev) => ({ ...prev, [sid]: ws }));
+      }
+    } catch {
+      // Workspace metadata fetch failures must not block ordinary chat.
+    }
+  }, [client]);
+
+  useEffect(() => {
+    if (!client || !sessionId || version === undefined) return;
+    const controller = new AbortController();
+    void refreshWorkspace(sessionId, controller.signal);
+    return () => controller.abort();
+  }, [client, sessionId, version, refreshWorkspace]);
+
+  const appendImportedFiles = useCallback((sid: string, imported: WorkspaceFileView[]) => {
+    if (!imported.length) return;
+    setWorkspaceBySession((prev) => {
+      const existing = prev[sid] ?? { session_id: sid, files: [], artifacts: [] };
+      const byId = new Map(existing.files.map((f) => [f.file_id, f]));
+      for (const f of imported) byId.set(f.file_id, f);
+      return { ...prev, [sid]: { ...existing, files: Array.from(byId.values()) } };
+    });
+    setPendingAttachmentsBySession((prev) => {
+      const current = prev[sid] ?? [];
+      const next = [...current];
+      for (const f of imported) {
+        if (!next.includes(f.file_id)) next.push(f.file_id);
+      }
+      return { ...prev, [sid]: next };
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!client || !isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    try {
+      void getCurrentWebview().onDragDropEvent((event) => {
+        const type = event.payload.type;
+        if (type === 'enter' || type === 'over') {
+          setIsDraggingFiles(true);
+        } else if (type === 'leave') {
+          setIsDraggingFiles(false);
+        } else if (type === 'drop') {
+          setIsDraggingFiles(false);
+          const sid = activeSessionIdRef.current;
+          const paths = event.payload.paths ?? [];
+          if (!sid || paths.length === 0) return;
+          setAttachmentBusy(true);
+          setAttachmentError('');
+          void importDroppedWorkspaceFiles(sid, paths).then((imported) => {
+            appendImportedFiles(sid, imported);
+          }).catch((err) => {
+            setAttachmentError(mcpErrorMessage(err, '拖拽导入附件失败。'));
+          }).finally(() => {
+            setAttachmentBusy(false);
+          });
+        }
+      }).then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      }).catch(() => {});
+    } catch {
+      // Ignore in non-Tauri or test environments.
+    }
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [client, appendImportedFiles]);
+
+  async function handlePickAttachments() {
+    if (!sessionId || attachmentBusy) return;
+    setAttachmentBusy(true);
+    setAttachmentError('');
+    try {
+      const imported = await selectAndImportWorkspaceFiles(sessionId);
+      appendImportedFiles(sessionId, imported);
+    } catch (err) {
+      setAttachmentError(mcpErrorMessage(err, '导入附件失败，请检查文件是否可读。'));
+    } finally {
+      setAttachmentBusy(false);
+    }
+  }
+
+  async function handleDeleteWorkspaceFile(sid: string, fileId: string) {
+    setAttachmentError('');
+    try {
+      await deleteWorkspaceFile(sid, fileId);
+      setWorkspaceBySession((prev) => {
+        const existing = prev[sid];
+        if (!existing) return prev;
+        return { ...prev, [sid]: { ...existing, files: existing.files.filter((f) => f.file_id !== fileId) } };
+      });
+      setPendingAttachmentsBySession((prev) => ({
+        ...prev,
+        [sid]: (prev[sid] ?? []).filter((id) => id !== fileId),
+      }));
+    } catch (err) {
+      setAttachmentError(mcpErrorMessage(err, '删除工作空间文件失败。'));
+    }
+  }
+
+  function handleContinueEditArtifact(artifact: ArtifactSummary) {
+    if (!sessionId) return;
+    setReferencedArtifactsBySession((prev) => {
+      const current = prev[sessionId] ?? [];
+      if (current.some((item) => item.artifact_id === artifact.artifact_id)) return prev;
+      return { ...prev, [sessionId]: [...current, artifact] };
+    });
+    const input = formRef.current?.querySelector('textarea');
+    input?.focus();
+  }
 
   useEffect(() => {
     if (!client || !ragEnabled || !sessionId) return;
@@ -779,6 +1253,18 @@ export default function Chat({
       enabled: useMcp,
       allow_external_data_egress: useMcp ? allowExternalDataEgress : false,
     };
+    const pendingAttachments = pendingAttachmentsBySession[id] ?? [];
+    const referencedArts = referencedArtifactsBySession[id] ?? [];
+    const skillsOptions = {
+      enabled: skillsEnabled,
+      selected_skill_ids: skillsEnabled && skillsMode === 'manual' ? selectedSkillIds : [],
+    };
+    if (pendingAttachments.length > 0) {
+      setPendingAttachmentsBySession((prev) => ({ ...prev, [id]: [] }));
+    }
+    if (referencedArts.length > 0) {
+      setReferencedArtifactsBySession((prev) => ({ ...prev, [id]: [] }));
+    }
     try {
       await client.streamRun(id, requestId, question, controller.signal, (item) => {
         if (controller.signal.aborted) return;
@@ -804,6 +1290,32 @@ export default function Chat({
               : session.live;
             return { ...session, live: nextLive, toolsByRun: { ...session.toolsByRun, [item.run_id]: items } };
           });
+        } else if (item.type === 'skill_activated') {
+          updateSession(id, (session) => {
+            if (session.live?.requestId !== requestId || session.live.runId !== item.run_id || session.live.detached) {
+              return session;
+            }
+            const prev = session.skillsByRun?.[item.run_id] ?? [];
+            if (prev.some((s) => s.skill_id === item.data.skill_id)) return session;
+            return {
+              ...session,
+              skillsByRun: {
+                ...session.skillsByRun,
+                [item.run_id]: [...prev, { skill_id: item.data.skill_id, name: item.data.name, revision: item.data.revision }],
+              },
+            };
+          });
+        } else if (item.type === 'artifact_created') {
+          updateSession(id, (session) => {
+            if (session.live?.requestId !== requestId || session.live.runId !== item.run_id || session.live.detached) {
+              return session;
+            }
+            const prev = session.artifactsByRun?.[item.run_id] ?? [];
+            const next = prev.some((a) => a.artifact_id === item.data.artifact_id)
+              ? prev.map((a) => (a.artifact_id === item.data.artifact_id ? item.data : a))
+              : [...prev, item.data];
+            return { ...session, artifactsByRun: { ...session.artifactsByRun, [item.run_id]: next } };
+          });
         } else if (item.type === 'run_citations') {
           updateSession(id, (session) => {
             if (session.live?.requestId !== requestId || session.live.runId !== item.run_id || session.live.detached) {
@@ -815,9 +1327,21 @@ export default function Chat({
             };
           });
         } else {
+          if (item.type === 'run_completed' && item.data.artifacts?.length) {
+            updateSession(id, (session) => ({
+              ...session,
+              artifactsByRun: { ...session.artifactsByRun, [item.run_id]: item.data.artifacts! },
+            }));
+          }
           settle(id, item.run_id);
         }
-      }, knowledgeOptions, mcpOptions);
+      },
+      knowledgeOptions,
+      mcpOptions,
+      skillsOptions,
+      pendingAttachments.length > 0 ? pendingAttachments : undefined,
+      referencedArts.length > 0 ? referencedArts.map((a) => a.artifact_id) : undefined,
+      );
     } catch (error) {
       if (controller.signal.aborted) return;
       if (error instanceof ApiRequestError && !['DUPLICATE_CLIENT_REQUEST', 'RUN_ALREADY_ACTIVE'].includes(error.code ?? '')) {
@@ -893,8 +1417,11 @@ export default function Chat({
     const hasAvailableMcpTools = effectiveMcpSummary === undefined || effectiveMcpSummary.effective_allowed_tools > 0;
     if (mcpEnabled && hasAvailableMcpTools) {
       const activeGrants = grantsBySession[active.session_id] ?? [];
+      const ws = workspaceBySession[active.session_id];
+      const hasWorkspaceFiles = (pendingAttachmentsBySession[active.session_id]?.length ?? 0) > 0
+        || (ws?.files.length ?? 0) > 0;
       const currentRagRisk = ragEnabled;
-      const currentFileGrantRisk = activeGrants.length > 0;
+      const currentFileGrantRisk = activeGrants.length > 0 || hasWorkspaceFiles;
       const { historicalRagRisk, historicalFileRisk } = inspectHistoricalContextRisk(active.turns);
       if (currentRagRisk || currentFileGrantRisk || historicalRagRisk || historicalFileRisk) {
         setEgressPrompt({
@@ -1038,7 +1565,16 @@ export default function Chat({
         </div>
       </aside>
 
-      <div className="chat-stage">
+      <div className={`chat-stage ${isDraggingFiles ? 'is-dragging' : ''}`}>
+        {isDraggingFiles && active && (
+          <div className="chat-drop-overlay" aria-live="polite">
+            <div className="chat-drop-card">
+              <span>📂</span>
+              <strong>松开鼠标，将文件导入当前会话工作空间</strong>
+              <small>原始文件保留不动，仅向工作空间复制一份副本</small>
+            </div>
+          </div>
+        )}
         {showPreview && (
           <div className="composer-dock">
             <div className="composer">
@@ -1083,6 +1619,24 @@ export default function Chat({
                 <span className="chat-model-badge">KnowledgeAgent 学术助教</span>
               </div>
               <div className="chat-topbar-right">
+                {(() => {
+                  const ws = workspaceBySession[active.session_id];
+                  const wsCount = (ws?.files.length ?? 0) + (ws?.artifacts.filter((a) => a.status === 'published').length ?? 0);
+                  return (
+                    <button
+                      type="button"
+                      className={`topbar-chip ${workspaceOpen ? 'active' : ''}`}
+                      aria-expanded={workspaceOpen}
+                      onClick={() => {
+                        setWorkspaceOpen((prev) => !prev);
+                        setGrantsOpen(false);
+                        setScopeOpen(false);
+                      }}>
+                      <span aria-hidden="true">📂</span>
+                      <span>工作空间{wsCount > 0 ? ` (${wsCount})` : ''}</span>
+                    </button>
+                  );
+                })()}
                 {ragEnabled && (
                   <button
                     type="button"
@@ -1091,6 +1645,7 @@ export default function Chat({
                     onClick={() => {
                       setScopeOpen((prev) => !prev);
                       setGrantsOpen(false);
+                      setWorkspaceOpen(false);
                     }}>
                     <span aria-hidden="true">📚</span>
                     <span>
@@ -1109,12 +1664,105 @@ export default function Chat({
                   onClick={() => {
                     setGrantsOpen((prev) => !prev);
                     setScopeOpen(false);
+                    setWorkspaceOpen(false);
                   }}>
                   <span aria-hidden="true">📎</span>
                   <span>文件授权</span>
                 </button>
               </div>
             </header>
+
+            <div className={`context-drawer ${workspaceOpen ? 'is-open' : 'is-closed'}`}>
+              {(() => {
+                const ws = workspaceBySession[active.session_id];
+                const files = ws?.files ?? [];
+                const artifacts = (ws?.artifacts ?? []).filter((a) => a.status === 'published');
+                const pendingIds = pendingAttachmentsBySession[active.session_id] ?? [];
+                return (
+                  <div className="workspace-drawer" aria-label="会话工作空间">
+                    <div className="workspace-drawer-head">
+                      <strong>当前会话工作空间</strong>
+                      <button
+                        type="button"
+                        className="artifact-btn primary"
+                        disabled={attachmentBusy}
+                        onClick={() => void handlePickAttachments()}>
+                        {attachmentBusy ? '导入中…' : '+ 添加文件'}
+                      </button>
+                    </div>
+                    <div className="workspace-drawer-grid">
+                      <div>
+                        <h4>已导入附件（{files.length}）</h4>
+                        {files.length === 0 ? (
+                          <p className="workspace-empty">可将 Word、Markdown、表格、图片等拖拽进聊天窗口或点击“添加文件”。</p>
+                        ) : (
+                          <ul className="workspace-file-list">
+                            {files.map((file) => {
+                              const attached = pendingIds.includes(file.file_id);
+                              return (
+                                <li key={file.file_id}>
+                                  <span>{fileIcon(file.original_name, file.media_type)}</span>
+                                  <span className="workspace-file-name" title={file.original_name}>{file.original_name}</span>
+                                  <span className="workspace-file-meta">{formatBytes(file.size_bytes)}</span>
+                                  <button
+                                    type="button"
+                                    className={`artifact-btn ${attached ? 'primary' : ''}`}
+                                    onClick={() => setPendingAttachmentsBySession((prev) => {
+                                      const cur = prev[active.session_id] ?? [];
+                                      return {
+                                        ...prev,
+                                        [active.session_id]: attached
+                                          ? cur.filter((id) => id !== file.file_id)
+                                          : [...cur, file.file_id],
+                                      };
+                                    })}>
+                                    {attached ? '已附带' : '本轮引用'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="artifact-btn danger"
+                                    onClick={() => void handleDeleteWorkspaceFile(active.session_id, file.file_id)}>
+                                    删除
+                                  </button>
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </div>
+                      <div>
+                        <h4>历史产物（{artifacts.length}）</h4>
+                        {artifacts.length === 0 ? (
+                          <p className="workspace-empty">本会话生成并交付的 Word、思维导图等文件会保存在这里。</p>
+                        ) : (
+                          <ul className="workspace-file-list">
+                            {artifacts.map((art) => (
+                              <li key={art.artifact_id}>
+                                <span>{fileIcon(art.filename, art.media_type)}</span>
+                                <span className="workspace-file-name" title={art.filename}>{art.filename}</span>
+                                <span className="workspace-file-meta">{formatBytes(art.size_bytes)}</span>
+                                <button
+                                  type="button"
+                                  className="artifact-btn"
+                                  onClick={() => void openArtifact(active.session_id, art.artifact_id)}>
+                                  打开
+                                </button>
+                                <button
+                                  type="button"
+                                  className="artifact-btn"
+                                  onClick={() => handleContinueEditArtifact(art)}>
+                                  继续编辑
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
 
             <div className={`context-drawer ${grantsOpen ? 'is-open' : 'is-closed'}`}>
               <GrantPanel client={client} sessionId={active.session_id} onGrantsChange={handleGrantsChange} />
@@ -1198,6 +1846,8 @@ export default function Chat({
                 {active.turns?.map(({ user, run, assistant }) => {
                   const status = user.run_id === trackedRunId ? active.activeStatus ?? run?.status : run?.status;
                   const turnTools = resolveTurnTools(active.toolsByRun?.[user.run_id], run?.tool_calls);
+                  const turnSkills = resolveTurnSkills(active.skillsByRun?.[user.run_id], run?.skill_activations);
+                  const turnArtifacts = resolveTurnArtifacts(active.artifactsByRun?.[user.run_id], run?.artifacts);
                   const turnCitations = active.citationsByRun?.[user.run_id] ?? run?.citations;
                   return (
                     <article key={user.message_id} className="turn">
@@ -1215,7 +1865,7 @@ export default function Chat({
                               {status ? statusLabels[status] : '运行状态未知'}
                             </small>
                           </div>
-                          <ToolActivity tools={turnTools} status={status} />
+                          <ToolActivity tools={turnTools} skills={turnSkills} status={status} />
                           {assistant && (
                             <MarkdownAnswer
                               ariaLabel="已保存回答"
@@ -1226,7 +1876,7 @@ export default function Chat({
                           {status === 'failed' && run && (
                             <p role="alert" className="turn-error-banner">
                               <span>
-                                {failureMessage(run.error_code)} {run.error_code && <code>{run.error_code}</code>}
+                                {run.error_message || failureMessage(run.error_code)} {run.error_code && <code>{run.error_code}</code>}
                               </span>
                               {onOpenMcpPanel && isMcpManageableError(run.error_code) && (
                                 <button type="button" className="inline-jump-btn" onClick={onOpenMcpPanel}>
@@ -1238,6 +1888,12 @@ export default function Chat({
                           {user.run_id === live?.runId && showDraft && (
                             <MarkdownAnswer ariaLabel="回答草稿" content={live.draft} />
                           )}
+                          <TurnArtifacts
+                            client={client}
+                            sessionId={active.session_id}
+                            artifacts={turnArtifacts}
+                            onContinueEdit={handleContinueEditArtifact}
+                          />
                           <TurnCitations citations={turnCitations} />
                         </div>
                       </div>
@@ -1263,8 +1919,22 @@ export default function Chat({
                                 : live.detached ? '运行状态未知' : '发送中'}
                           </small>
                         </div>
-                        {live.runId && <ToolActivity tools={active.toolsByRun?.[live.runId]} status={active.activeStatus} />}
+                        {live.runId && (
+                          <ToolActivity
+                            tools={active.toolsByRun?.[live.runId]}
+                            skills={active.skillsByRun?.[live.runId]}
+                            status={active.activeStatus}
+                          />
+                        )}
                         {showDraft && <MarkdownAnswer ariaLabel="回答草稿" content={live.draft} />}
+                        {live.runId && (
+                          <TurnArtifacts
+                            client={client}
+                            sessionId={active.session_id}
+                            artifacts={active.artifactsByRun?.[live.runId]}
+                            onContinueEdit={handleContinueEditArtifact}
+                          />
+                        )}
                         {live.runId && <TurnCitations citations={active.citationsByRun?.[live.runId]} />}
                       </div>
                     </div>
@@ -1409,20 +2079,130 @@ export default function Chat({
               })()}
 
               <form ref={formRef} className="composer" onSubmit={send}>
+                {(() => {
+                  const ws = workspaceBySession[active.session_id];
+                  const pendingIds = pendingAttachmentsBySession[active.session_id] ?? [];
+                  const pendingFiles = pendingIds
+                    .map((fid) => ws?.files.find((f) => f.file_id === fid))
+                    .filter((f): f is WorkspaceFileView => Boolean(f));
+                  const refArts = referencedArtifactsBySession[active.session_id] ?? [];
+                  if (pendingFiles.length === 0 && refArts.length === 0 && !attachmentError) return null;
+                  return (
+                    <div className="composer-attachments" aria-label="本轮附件与引用产物">
+                      {pendingFiles.map((file) => (
+                        <span key={file.file_id} className="attachment-chip">
+                          <span>{fileIcon(file.original_name, file.media_type)}</span>
+                          <span className="attachment-chip-name" title={file.original_name}>{file.original_name}</span>
+                          <span className="attachment-chip-size">{formatBytes(file.size_bytes)}</span>
+                          <button
+                            type="button"
+                            className="attachment-chip-remove"
+                            aria-label={`移除附件 ${file.original_name}`}
+                            onClick={() => setPendingAttachmentsBySession((prev) => ({
+                              ...prev,
+                              [active.session_id]: (prev[active.session_id] ?? []).filter((id) => id !== file.file_id),
+                            }))}>
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                      {refArts.map((art) => (
+                        <span key={art.artifact_id} className="attachment-chip is-artifact">
+                          <span>✏️</span>
+                          <span className="attachment-chip-name" title={art.filename}>继续编辑：{art.filename}</span>
+                          <button
+                            type="button"
+                            className="attachment-chip-remove"
+                            aria-label={`取消引用产物 ${art.filename}`}
+                            onClick={() => setReferencedArtifactsBySession((prev) => ({
+                              ...prev,
+                              [active.session_id]: (prev[active.session_id] ?? []).filter((a) => a.artifact_id !== art.artifact_id),
+                            }))}>
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                      {attachmentError && <span role="alert" className="attachment-error-inline">{attachmentError}</span>}
+                    </div>
+                  );
+                })()}
+
                 <label htmlFor="question" className="sr-only">问题</label>
                 <textarea
                   id="question"
                   rows={2}
                   value={active.input}
-                  placeholder="给 KnowledgeAgent 发送消息…（Enter 发送，Shift + Enter 换行）"
+                  placeholder="给 KnowledgeAgent 发送消息，或拖拽文件到此导入工作空间…（Enter 发送，Shift + Enter 换行）"
                   onKeyDown={handleComposerKeyDown}
                   onChange={(event) => {
                     const input = event.target.value;
                     updateSession(active.session_id, (session) => ({ ...session, input }));
                   }}
                 />
+                {skillsEnabled && skillsPickerOpen && (
+                  <div className="skills-picker-bar" role="region" aria-label="选择本轮 Skills">
+                    <div className="skills-picker-head">
+                      <label className="skills-mode-option">
+                        <input
+                          type="radio"
+                          name="skills-mode"
+                          checked={skillsMode === 'auto'}
+                          onChange={() => changeSkillsMode('auto')}
+                        />
+                        <span>自动匹配（推荐）</span>
+                      </label>
+                      <label className="skills-mode-option">
+                        <input
+                          type="radio"
+                          name="skills-mode"
+                          checked={skillsMode === 'manual'}
+                          onChange={() => changeSkillsMode('manual')}
+                        />
+                        <span>手动指定</span>
+                      </label>
+                      {onOpenSkillsPanel && (
+                        <button type="button" className="inline-jump-btn" onClick={onOpenSkillsPanel}>
+                          管理 Skills
+                        </button>
+                      )}
+                    </div>
+                    {skillsMode === 'manual' && (
+                      <div className="skills-picker-chips">
+                        {enabledSkills.length === 0 ? (
+                          <span className="skills-picker-empty">暂无已启用技能，可前往 Skills 页启用或导入。</span>
+                        ) : (
+                          enabledSkills.map((sk) => {
+                            const selectedSk = selectedSkillIds.includes(sk.skill_id);
+                            return (
+                              <label key={sk.skill_id} className={`skill-select-chip ${selectedSk ? 'selected' : ''}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={selectedSk}
+                                  onChange={() => setSelectedSkillIds((prev) =>
+                                    prev.includes(sk.skill_id)
+                                      ? prev.filter((id) => id !== sk.skill_id)
+                                      : [...prev, sk.skill_id],
+                                  )}
+                                />
+                                <span>{sk.name}</span>
+                              </label>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="composer-bottom-bar">
                   <section className="knowledge-qa-inline" aria-label="教材知识库与工具设置">
+                    <button
+                      type="button"
+                      className="attach-file-btn"
+                      disabled={attachmentBusy || busy}
+                      onClick={() => void handlePickAttachments()}
+                      title="选择本地文件导入当前会话工作空间">
+                      {attachmentBusy ? '导入中…' : '📎 附件'}
+                    </button>
                     <label className={`rag-pill-toggle ${ragEnabled ? 'is-on' : ''}`}>
                       <input
                         type="checkbox"
@@ -1446,6 +2226,34 @@ export default function Chat({
                           : ''}
                       </span>
                     </label>
+                    <div className="skills-pill-group">
+                      <label className={`rag-pill-toggle skills-pill-toggle ${skillsEnabled ? 'is-on' : ''}`}>
+                        <input
+                          type="checkbox"
+                          aria-label="启用 Skills"
+                          checked={skillsEnabled}
+                          onChange={(e) => toggleSkillsEnabled(e.target.checked)}
+                        />
+                        <span>
+                          🧩 Skills
+                          {skillsEnabled && skillsMode === 'manual' && selectedSkillIds.length > 0
+                            ? `（已选 ${selectedSkillIds.length}）`
+                            : skillsEnabled && enabledSkills.length > 0
+                              ? `（${enabledSkills.length}）`
+                              : ''}
+                        </span>
+                      </label>
+                      {skillsEnabled && (
+                        <button
+                          type="button"
+                          className={`skills-mode-btn ${skillsPickerOpen ? 'active' : ''}`}
+                          aria-expanded={skillsPickerOpen}
+                          aria-label="配置 Skills 模式"
+                          onClick={() => setSkillsPickerOpen((prev) => !prev)}>
+                          {skillsMode === 'manual' ? '指定 ▾' : '自动 ▾'}
+                        </button>
+                      )}
+                    </div>
                     {ragEnabled && (
                       <div className="knowledge-qa-selects">
                         <label>

@@ -2,17 +2,17 @@
 
 <p align="center">
   <strong>面向 macOS Apple Silicon 的本地优先 AI Agent 桌面助手</strong><br />
-  集成 DeepSeek 实时流式对话、理工科教材知识库（RAG + 原文级引用溯源）、受控只读本地文件工具与 MCP 外部工具生态
+  集成 DeepSeek 实时流式对话、理工科教材知识库（RAG + 原文级引用溯源）、受控只读本地文件工具、MCP 外部工具生态与 Agent Skills / Workspace / Runtime 真实文件交付能力
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.3.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.4.0-blue" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-24C8DB" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB" />
   <img alt="MCP" src="https://img.shields.io/badge/MCP%20SDK-2.3.0-6B4FBB" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-466%20passing-brightgreen" />
+  <img alt="Skills" src="https://img.shields.io/badge/Agent%20Skills-SKILL.md-0EA5E9" />
 </p>
 
 ---
@@ -74,6 +74,15 @@
 - 通过 macOS 原生文件/目录选择器按会话登记临时授权（应用重启即失效，可随时撤销）。
 - 提供 `list_files`（目录发现、分页、过滤隐藏项与软链）与 `read_text`（分段读取、UTF-8/GBK 兼容、严格大小限制），底层使用 macOS `O_NOFOLLOW_ANY` 防软链逃逸与 TOCTOU 攻击。
 
+### 5. Agent Skills、会话工作空间（Workspace）与独立运行环境（Runtime）（`v0.4.0` 新增）
+- **兼容标准 `SKILL.md` 与渐进式加载**：支持 Agent Skills 开放标准（YAML frontmatter + `scripts/`、`references/`、`assets/`），默认仅向模型披露已启用技能摘要，命中任务后再通过 `load_skill` 与 `read_skill_file` 按需加载。
+- **开箱即用内置技能**：
+  - `mind-map`：生成可编辑 Mermaid 源文件（`.mmd`）并渲染为高清中文 `.png` 与 `.svg` 矢量图，支持聊天内联预览与基于历史 `.mmd` 连续修改；
+  - `word-formatting`：按用户要求调整 `.docx` 标题、中西文字体、字号、行距、段间距、首行缩进、页边距与表格样式（原生支持全 `Normal` 样式真实中文文档的段落索引映射），自动回读校验正文无损后交付新版本。
+- **第三方 GitHub / 本地 / ZIP 技能导入**：支持公开 GitHub 仓库根 URL（如 `https://github.com/anthropics/skills`）、子目录 URL、本地文件夹与 ZIP 压缩包预览、选择性安装、依赖自动检测与一键准备、版本更新与删除（已实测导入并执行 `anthropics/skills` 中的 `xlsx` 技能生成含公式与条件格式的真实 Excel 工作簿）。
+- **会话级持久化工作空间与产物交付**：支持多文件导入与原生拖拽导入附件（自动保存原件副本不覆盖源文件）；每轮任务拥有独立 `work/`、`output/` 工作目录，通过 `publish_artifact` 原子发布至版本化 `artifacts/`，支持图片内联 Blob 预览、系统打开、Finder 定位、另存为、跨轮引用继续编辑及重启恢复。
+- **独立执行 Runtime 与执行稳定性保障**：脚本在 `<app_data_dir>/runtime/`（独立 Python `venv` 与 `npm-tools`）中执行，自动探测本机 `uv`、`node`、`git` 与 `Google Chrome`（兼容 Finder 极简 `PATH`），绝不污染后端 Sidecar；集中预算控制（Skills 单轮总上限 100 次 / Skills 子预算 80 次 / `recursion_limit=250` / 1800s 超时）、可恢复工具失败自动修正、临时网络/限流最多 3 次退避重试（不重复执行已完成工具）及单次 8192-token 输出截断自动恢复。
+
 ---
 
 ## 系统架构与安全边界
@@ -86,20 +95,24 @@ flowchart TD
     AGENT["LangGraph Agent & RunTools\n实时流式 · 工具快照 · 统一预算 · Checkpointer"]
     RAG["教材知识库引擎\nPDF/DOCX/MD 解析 · FTS5 + BGE-M3 混合检索 · 引用核验"]
     MCP["MCP Manager (mcp==2.3.0)\nstdio 子进程管理 · Streamable HTTP"]
-    DB[("本地 SQLite (WAL)\n业务库 V6 · Checkpoints · 知识库")]
-    EXT["外部服务\nDeepSeek · SiliconFlow · 远程/本地 MCP"]
+    SKILLS["Skills / Workspace / Runtime\n标准 SKILL.md · 独立 Python/Node 执行 · 产物交付"]
+    DB[("本地 SQLite (WAL)\n业务库 V7 · Checkpoints · 知识库")]
+    EXT["外部服务\nDeepSeek · SiliconFlow · 远程/本地 MCP · GitHub Skills"]
 
-    UI -- "受限 IPC (仅凭据提交/文件选择/MCP管理)" --> HOST
+    UI -- "受限 IPC (凭据/文件/MCP/Skills/产物操作)" --> HOST
     UI -- "HTTP / SSE (Bearer ui_token)" --> SIDECAR
     HOST -- "stdin/stdout 握手 & 特权 API (Bearer host_token)" --> SIDECAR
     SIDECAR --> AGENT
     SIDECAR --> RAG
     SIDECAR --> MCP
+    SIDECAR --> SKILLS
     AGENT --> DB
     RAG --> DB
     MCP --> DB
+    SKILLS --> DB
     AGENT --> EXT
     MCP --> EXT
+    SKILLS --> EXT
 ```
 
 **核心安全不变量**：
@@ -189,14 +202,16 @@ pnpm --dir frontend install --frozen-lockfile
 ```
 
 构建产物位置：
-- **桌面应用包**：`desktop/target/packaging/apps/onedir/KnowledgeAgent.app`（约 128 MB）
-- **安装镜像**：`desktop/target/packaging/dmg/KnowledgeAgent_0.3.0_aarch64-test.dmg`（约 70 MB）
+- **桌面应用包**：`desktop/target/packaging/apps/onedir/KnowledgeAgent.app`（约 129 MB）
+- **安装镜像**：
+  - `desktop/target/aarch64-apple-darwin/release/bundle/dmg/KnowledgeAgent_0.4.0_aarch64.dmg`（约 70 MB）
+  - `desktop/target/packaging/dmg/KnowledgeAgent_0.4.0_aarch64-test.dmg`（约 70 MB，同镜像副本）
 
 > 当前打包脚本采用个人使用版 **ad-hoc 签名**（`signingIdentity: "-"`），未进行 Apple Developer ID 商业签名与 Apple 公证。首次打开如遇系统拦截，可右键 `KnowledgeAgent.app` 选择「打开」，或在「系统设置 → 隐私与安全性」中点击「仍要打开」。
 
 ---
 
-## 配置指南（模型与 MCP 服务）
+## 配置指南（模型、Agent Skills 与 MCP 服务）
 
 ### 1. 配置模型 API Key
 在应用左下角设置面板输入并保存：
@@ -204,6 +219,11 @@ pnpm --dir frontend install --frozen-lockfile
 - **SiliconFlow API Key**（可选）：用于教材知识库 `BAAI/bge-m3` 向量索引与混合检索；不配置时教材库仍可使用纯本地 FTS5 关键词检索。
 
 两个凭据分别保存在独立的 macOS 钥匙串条目中，应用重启或 Sidecar 异常恢复后自动重新注入内存。
+
+### 2. 使用 Agent Skills 与导入 GitHub 技能
+- 打开左侧 **「🧩 Skills」** 页面，查看本机独立运行环境状态（自动探测 `uv`、`Node.js`、`Git`、`Google Chrome`），点击 **「准备基础依赖」** 即可一键初始化独立 Python 虚拟环境（`python-docx`）与 `Mermaid CLI`。
+- **导入 GitHub 第三方技能**：在「导入第三方技能」输入框粘贴公开 GitHub 仓库或子目录 URL（例如 `https://github.com/anthropics/skills`），点击 **「获取技能列表」** → 勾选所需技能（如 `xlsx`）→ **「安装并启用」** → 若提示缺少依赖点击 **「安装依赖」** 即可。同样支持「导入本地文件夹」与「导入 ZIP」。
+- **在聊天中使用**：点击输入框工具栏 **「📎 附件」** 或直接将本地文档拖拽进聊天窗口导入工作空间，保持 **「🧩 Skills」** 为开启（自动匹配或手动指定），即可执行排版、思维导图、表格生成与基于历史产物的连续修改。
 
 ### 2. 接入推荐的 5 个真实 MCP 服务（无需新增付费 API Key）
 
@@ -268,13 +288,11 @@ which mcp-server-fetch arxiv-mcp-server
 
 ## 自动化测试
 
-当前测试基线：**466 项自动化测试全部通过**（后端 `pytest` **400** 项 + 前端 `Vitest` **41** 项 + Rust `cargo test` **25** 项）：
-
 ```sh
-# 后端全量测试与字节码检查（400 passed）
+# 后端全量测试与字节码检查（含 P9 Workspace / Runtime / Skills / 稳定性回归）
 (cd backend && uv run --locked pytest && uv run --locked python -m compileall -q app tests)
 
-# 前端类型检查、单元测试与生产构建（41 passed）
+# 前端类型检查、单元测试与生产构建（43 passed）
 pnpm --dir frontend exec tsc --noEmit
 pnpm --dir frontend test
 pnpm --dir frontend build
@@ -293,21 +311,25 @@ pnpm --dir frontend build
 ~/Library/Application Support/local.knowledgeagent.desktop/
 ```
 
-从旧版本（如 `v0.2.x`，Schema V5）升级至 `v0.3.0`（Schema V6）时：
-1. 完全退出正在运行的旧版应用；
-2. 强烈建议先备份数据目录（V5 → V6 为单向架构升级）：
+从旧版本（如 `v0.3.0`，Schema V6）升级至 `v0.4.0`（Schema V7）时：
+1. 完全退出正在运行的旧版应用（菜单栏 `KnowledgeAgent → 退出` 或 `Cmd+Q`）；
+2. 强烈建议先备份数据目录（V6 → V7 为单向架构升级）：
    ```sh
    cp -R "$HOME/Library/Application Support/local.knowledgeagent.desktop" \
      "$HOME/Library/Application Support/local.knowledgeagent.desktop.backup-$(date +%Y%m%d-%H%M%S)"
    ```
-3. 覆盖安装新版 `KnowledgeAgent.app` 至 `/Applications/` 并启动，软件会自动新增 `mcp_servers` 与 `mcp_tools` 表，完整保留所有历史会话、消息、引用卡片与教材索引；
-4. 因个人版为 ad-hoc 签名，覆盖更新后首次启动若弹出 macOS 钥匙串授权框，点击「始终允许」即可自动恢复已保存的 API Key。
+3. 打开新版 `KnowledgeAgent_0.4.0_aarch64.dmg`，将 `KnowledgeAgent.app` 拖入 `/Applications/` 覆盖旧版后启动：
+   - SQLite 自动执行 V6 → V7 迁移，新增 `skills`、`workspace_files`、`artifacts`、`run_skill_activations` 表并扩展 `tool_calls`，完整保留全部历史会话、消息、教材知识库、向量索引、MCP 服务配置与授权；
+   - 自动发现并注册内置技能（`word-formatting`、`mind-map`）；
+4. 因个人版为 ad-hoc 签名，覆盖更新后首次启动若弹出 macOS 钥匙串授权框，点击「始终允许」即可自动恢复已保存的模型 API Key 与 MCP 密钥。
 
 ---
 
 ## 已知限制与注意事项
 
-- **平台支持**：当前仅针对 macOS Apple Silicon 深度实现（强依赖 `Security.framework`、macOS 原生对话框与 `O_NOFOLLOW_ANY`），Windows 适配尚在远期规划中。
+- **平台与签名**：当前仅面向 macOS Apple Silicon；个人版采用 ad-hoc 签名、未接入 Apple Developer 公证（Notarization），首次覆盖更新可能弹出钥匙串访问确认或需在「隐私与安全性」中点击「仍要打开」。
+- **Runtime 执行模型与依赖**：Skills 的 Python / Shell / Node.js 执行继承本机当前用户权限（非 Docker/VM 沙箱）；独立 Python 依赖与 Mermaid CLI 按需在线安装，首次安装需本机具备 `uv`、`node`/`npm` 与 Chrome/Chromium（系统级依赖不随 `.app` 内置）。
+- **可选重型文档校验工具**：第三方 `xlsx` 技能自带的可选 `recalc.py` 公式重算脚本依赖 LibreOffice（`soffice`）；若本机未安装 LibreOffice，Excel 文件的生成、样式、条件格式与公式写入仍完全可用，仅跳过 LibreOffice 静态重算校验。
 - **DeepWiki 大仓库整库读取**：对超大型 GitHub 仓库直接调用 `read_wiki_contents` 可能触发 2 MiB 响应体积上限（`MCP_RESPONSE_TOO_LARGE`），推荐让 Agent 优先调用 `read_wiki_structure` + `ask_wiki_question`；高频突发调用偶发上游流中断，正常对话节奏下稳定。
 - **Exa 免费端点限流**：匿名免费端点在短时间高频请求下可能触发限流，如需更高配额可在服务设置中添加自定义 Header/API Key。
 - **外部 stdio 工具独立分发**：`mcp-server-fetch` 与 `arxiv-mcp-server` 需在本机通过 `uv tool install` 单独安装，不随 `.app` 分发。
@@ -316,9 +338,10 @@ pnpm --dir frontend build
 
 ## 架构与设计文档
 
-- [系统架构设计（v0.3）](架构.md)
+- [系统架构设计（v0.4）](架构.md)
 - [API / SSE / IPC 接口契约（v0.2）](接口.md)
-- [开发路线与阶段验收标准（v0.4）](开发路线与验收.md)
+- [开发路线与阶段验收标准（v0.5）](开发路线与验收.md)
 - [教材知识库 RAG 架构方案（v0.2）](KnowledgeAgent_RAG_Architecture_v0.2.md)
 - [MCP 集成架构与安全方案（v0.2）](KnowledgeAgent_MCP_Architecture_v0.2.md)
+- [Workspace、Runtime 与 Agent Skills 架构方案（v0.1 + 第16节修订）](KnowledgeAgent_Skills_Architecture_v0.1.md)
 - [项目进度、缺陷分析与后续开发计划](项目进度与缺陷分析及后续开发计划.md)

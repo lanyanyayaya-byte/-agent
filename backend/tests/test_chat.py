@@ -132,10 +132,12 @@ def test_real_sqlite_schema_and_constraints(tmp_path):
     with closing(store._connect()) as db:
         assert db.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert db.execute("PRAGMA busy_timeout").fetchone() == (BUSY_TIMEOUT_MS,)
-        assert db.execute("PRAGMA user_version").fetchone() == (6,)
+        assert db.execute("PRAGMA user_version").fetchone() == (7,)
         assert db.execute("PRAGMA foreign_keys").fetchone() == (1,)
     assert rows(path, "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name") == [
-        ("mcp_servers",), ("mcp_tools",), ("messages",), ("run_citations",), ("runs",), ("sessions",), ("tool_calls",),
+        ("artifacts",), ("mcp_servers",), ("mcp_tools",), ("messages",),
+        ("run_citations",), ("run_skill_activations",), ("runs",), ("sessions",),
+        ("skills",), ("tool_calls",), ("workspace_files",),
     ]
 
     session = store.create_session("实测")

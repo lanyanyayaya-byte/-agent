@@ -180,6 +180,60 @@ MIGRATIONS = (
         "ALTER TABLE tool_calls ADD COLUMN definition_hash TEXT",
         "ALTER TABLE tool_calls ADD COLUMN duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0)",
     ),
+    (
+        """CREATE TABLE skills (
+            skill_id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL CHECK (source_type IN ('builtin', 'local', 'github')),
+            source_url TEXT,
+            revision TEXT NOT NULL,
+            relative_dir TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX skills_by_name ON skills (name COLLATE NOCASE)",
+        """CREATE TABLE workspace_files (
+            file_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(session_id),
+            original_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            created_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX workspace_files_by_session ON workspace_files (session_id, created_at DESC, file_id DESC)",
+        """CREATE TABLE artifacts (
+            artifact_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(session_id),
+            run_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            title TEXT,
+            relative_path TEXT NOT NULL,
+            media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            status TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged', 'published', 'discarded')),
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id, run_id) REFERENCES runs (session_id, run_id)
+        )""",
+        "CREATE INDEX artifacts_by_session_run ON artifacts (session_id, run_id, created_at, artifact_id)",
+        "CREATE INDEX artifacts_by_session_status ON artifacts (session_id, status, created_at DESC)",
+        """CREATE TABLE run_skill_activations (
+            activation_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            name_snapshot TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            activated_at TEXT NOT NULL,
+            FOREIGN KEY (session_id, run_id) REFERENCES runs (session_id, run_id)
+        )""",
+        "CREATE INDEX skill_activations_by_run ON run_skill_activations (session_id, run_id, activated_at)",
+        "ALTER TABLE tool_calls ADD COLUMN tool_category TEXT CHECK (tool_category IS NULL OR tool_category IN ('skill', 'workspace', 'runtime'))",
+        "ALTER TABLE tool_calls ADD COLUMN recoverable INTEGER NOT NULL DEFAULT 0 CHECK (recoverable IN (0, 1))",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -215,6 +269,10 @@ class Message:
     status: Literal["committed"] = "committed"
 
 
+ToolCategory = Literal["skill", "workspace", "runtime"]
+ArtifactStatus = Literal["staged", "published", "discarded"]
+
+
 @dataclass(frozen=True)
 class ToolCallSummary:
     tool_call_id: str
@@ -227,6 +285,31 @@ class ToolCallSummary:
     server_name: str | None = None
     original_tool_name: str | None = None
     duration_ms: int | None = None
+    tool_category: ToolCategory | None = None
+    recoverable: bool = False
+
+
+@dataclass(frozen=True)
+class StoredArtifact:
+    artifact_id: str
+    session_id: str
+    run_id: str
+    filename: str
+    title: str | None
+    relative_path: str
+    media_type: str
+    size_bytes: int
+    status: ArtifactStatus
+    created_at: str
+
+
+@dataclass(frozen=True)
+class StoredSkillActivation:
+    activation_id: str
+    skill_id: str
+    name_snapshot: str
+    revision: str
+    activated_at: str
 
 
 @dataclass(frozen=True)
@@ -259,8 +342,11 @@ class RunSummary:
     error_code: str | None
     started_at: str
     finished_at: str | None
+    error_message: str | None = None
     tool_calls: tuple[ToolCallSummary, ...] = ()
     citations: tuple[StoredCitation, ...] = ()
+    artifacts: tuple[StoredArtifact, ...] = ()
+    skill_activations: tuple[StoredSkillActivation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,6 +461,7 @@ class BusinessStore:
                 self._finish_pending_tools(
                     connection, session_id, run_id, "failed", "工具调用已中断。", INTERRUPTED_CODE, now,
                 )
+                self._discard_staged_artifacts(connection, session_id, run_id)
         return recovered
 
     def _connect(self) -> sqlite3.Connection:
@@ -423,6 +510,9 @@ class BusinessStore:
             ).fetchone()
             if active:
                 raise RunConflict("RUN_ALREADY_ACTIVE", active[0])
+            connection.execute("DELETE FROM run_skill_activations WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM artifacts WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM workspace_files WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM run_citations WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
@@ -459,7 +549,7 @@ class BusinessStore:
             boundary = "AND (r.started_at, r.run_id) < (?, ?)" if before else ""
             rows = connection.execute(
                 f"""SELECT r.run_id, r.session_id, m.message_id, r.status, r.error_code,
-                           r.started_at, r.finished_at
+                           r.started_at, r.finished_at, r.error_message
                     FROM runs AS r JOIN messages AS m ON m.run_id = r.run_id AND m.role = 'user'
                     WHERE r.session_id = ? {boundary}
                     ORDER BY r.started_at DESC, r.run_id DESC LIMIT ?""",
@@ -473,9 +563,11 @@ class BusinessStore:
             for (
                 run_id, call_id, name, status, summary, error_code,
                 source, server_id, server_name_snapshot, original_tool_name, duration_ms,
+                tool_category, recoverable,
             ) in connection.execute(
                 f"""SELECT run_id, tool_call_id, tool_name, status, summary, error_code,
-                           source, server_id, server_name_snapshot, original_tool_name, duration_ms
+                           source, server_id, server_name_snapshot, original_tool_name, duration_ms,
+                           tool_category, recoverable
                     FROM tool_calls WHERE session_id = ? AND run_id IN ({placeholders})
                     ORDER BY rowid""",
                 (session_id, *run_ids),
@@ -491,6 +583,8 @@ class BusinessStore:
                     server_name=server_name_snapshot,
                     original_tool_name=original_tool_name,
                     duration_ms=duration_ms,
+                    tool_category=tool_category,
+                    recoverable=bool(recoverable),
                 ))
 
             citations_by_run: dict[str, list[StoredCitation]] = defaultdict(list)
@@ -523,11 +617,56 @@ class BusinessStore:
                     snippet=snippet,
                 ))
 
+            artifacts_by_run: dict[str, list[StoredArtifact]] = defaultdict(list)
+            for (
+                run_id, artifact_id, filename, title, relative_path, media_type,
+                size_bytes, status, created_at,
+            ) in connection.execute(
+                f"""SELECT run_id, artifact_id, filename, title, relative_path, media_type,
+                           size_bytes, status, created_at
+                    FROM artifacts
+                    WHERE session_id = ? AND run_id IN ({placeholders}) AND status = 'published'
+                    ORDER BY created_at, rowid""",
+                (session_id, *run_ids),
+            ):
+                artifacts_by_run[run_id].append(StoredArtifact(
+                    artifact_id=artifact_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    filename=filename,
+                    title=title,
+                    relative_path=relative_path,
+                    media_type=media_type,
+                    size_bytes=size_bytes,
+                    status=status,
+                    created_at=created_at,
+                ))
+
+            activations_by_run: dict[str, list[StoredSkillActivation]] = defaultdict(list)
+            for (
+                run_id, activation_id, skill_id, name_snapshot, revision, activated_at,
+            ) in connection.execute(
+                f"""SELECT run_id, activation_id, skill_id, name_snapshot, revision, activated_at
+                    FROM run_skill_activations
+                    WHERE session_id = ? AND run_id IN ({placeholders})
+                    ORDER BY activated_at, rowid""",
+                (session_id, *run_ids),
+            ):
+                activations_by_run[run_id].append(StoredSkillActivation(
+                    activation_id=activation_id,
+                    skill_id=skill_id,
+                    name_snapshot=name_snapshot,
+                    revision=revision,
+                    activated_at=activated_at,
+                ))
+
             return [
                 RunSummary(
                     *row,
                     tool_calls=tuple(tools_by_run.get(row[0], ())),
                     citations=tuple(citations_by_run.get(row[0], ())),
+                    artifacts=tuple(artifacts_by_run.get(row[0], ())),
+                    skill_activations=tuple(activations_by_run.get(row[0], ())),
                 )
                 for row in rows
             ]
@@ -623,6 +762,14 @@ class BusinessStore:
                     if citation_exists is not None:
                         has_rag = True
 
+            if not has_file:
+                workspace_file_exists = connection.execute(
+                    "SELECT 1 FROM workspace_files WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if workspace_file_exists is not None:
+                    has_file = True
+
             return SessionEgressRisk(
                 has_historical_file_context=has_file,
                 has_historical_rag_context=has_rag,
@@ -714,18 +861,20 @@ class BusinessStore:
         server_name_snapshot: str | None = None,
         original_tool_name: str | None = None,
         definition_hash: str | None = None,
+        tool_category: ToolCategory | None = None,
     ) -> None:
         with closing(self._connect()) as connection, self._write(connection):
             changed = connection.execute(
                 """INSERT INTO tool_calls (
                        tool_call_id, session_id, run_id, tool_name, status, started_at,
-                       source, server_id, server_name_snapshot, original_tool_name, definition_hash
+                       source, server_id, server_name_snapshot, original_tool_name, definition_hash,
+                       tool_category
                    )
-                   SELECT ?, session_id, run_id, ?, 'running', ?, ?, ?, ?, ?, ? FROM runs
+                   SELECT ?, session_id, run_id, ?, 'running', ?, ?, ?, ?, ?, ?, ? FROM runs
                    WHERE session_id = ? AND run_id = ? AND status IN ('running', 'cancelling')""",
                 (
                     call_id, name, utc_now(), source, server_id, server_name_snapshot,
-                    original_tool_name, definition_hash, run.session_id, run.run_id,
+                    original_tool_name, definition_hash, tool_category, run.session_id, run.run_id,
                 ),
             ).rowcount
             if changed != 1:
@@ -740,13 +889,18 @@ class BusinessStore:
         error_code: str | None,
         *,
         duration_ms: int | None = None,
+        recoverable: bool = False,
     ) -> None:
         with closing(self._connect()) as connection, self._write(connection):
             changed = connection.execute(
                 """UPDATE tool_calls
-                   SET status = ?, summary = ?, error_code = ?, finished_at = ?, duration_ms = ?
+                   SET status = ?, summary = ?, error_code = ?, finished_at = ?, duration_ms = ?, recoverable = ?
                    WHERE session_id = ? AND run_id = ? AND tool_call_id = ? AND status = 'running'""",
-                (status, summary, error_code, utc_now(), duration_ms, run.session_id, run.run_id, call_id),
+                (
+                    status, summary, error_code, utc_now(), duration_ms,
+                    1 if (recoverable and status == "failed") else 0,
+                    run.session_id, run.run_id, call_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Tool call has no active audit entry")
@@ -759,13 +913,20 @@ class BusinessStore:
         now, message_id = utc_now(), str(uuid4())
         with closing(self._connect()) as connection, self._write(connection):
             if connection.execute(
-                """SELECT 1 FROM tool_calls WHERE session_id = ? AND run_id = ? AND status != 'completed'""",
+                """SELECT 1 FROM tool_calls
+                   WHERE session_id = ? AND run_id = ?
+                     AND NOT (status = 'completed' OR (status = 'failed' AND recoverable = 1))""",
                 (run.session_id, run.run_id),
             ).fetchone():
                 raise RuntimeError("Run completion requires successful tool calls")
             if not self._finish(connection, run, "completed", now, from_statuses=("running",),
                                 final_checkpoint_id=final_checkpoint_id):
                 return None
+            connection.execute(
+                """UPDATE artifacts SET status = 'published'
+                   WHERE session_id = ? AND run_id = ? AND status = 'staged'""",
+                (run.session_id, run.run_id),
+            )
             connection.execute(
                 """INSERT INTO messages (message_id, session_id, run_id, role, content, created_at)
                    VALUES (?, ?, ?, 'assistant', ?, ?)""",
@@ -824,12 +985,22 @@ class BusinessStore:
                 BusinessStore._finish_pending_tools(
                     connection, run.session_id, run.run_id, "cancelled", "工具调用已取消。", "RUN_CANCELLED", now,
                 )
+                BusinessStore._discard_staged_artifacts(connection, run.session_id, run.run_id)
             elif status == "failed":
                 BusinessStore._finish_pending_tools(
                     connection, run.session_id, run.run_id, "failed", "工具调用已中断。", INTERRUPTED_CODE, now,
                 )
+                BusinessStore._discard_staged_artifacts(connection, run.session_id, run.run_id)
             connection.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, run.session_id))
         return changed == 1
+
+    @staticmethod
+    def _discard_staged_artifacts(connection: sqlite3.Connection, session_id: str, run_id: str) -> None:
+        connection.execute(
+            """UPDATE artifacts SET status = 'discarded'
+               WHERE session_id = ? AND run_id = ? AND status = 'staged'""",
+            (session_id, run_id),
+        )
 
     @staticmethod
     def _finish_pending_tools(

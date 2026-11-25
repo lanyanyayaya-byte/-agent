@@ -143,3 +143,86 @@ test('parses incremental MCP tool event metadata while preserving native tool ev
     },
   });
 });
+
+test('parses skill_activated, recoverable tool_failed, artifact_created, and run_completed artifacts', () => {
+  const base = { version: 1, session_id: 's1', run_id: 'r1', ts: '2026-11-25T09:00:00Z' };
+
+  const skillEvent = parseRunEvent({
+    ...base,
+    type: 'skill_activated',
+    data: { skill_id: 'mind-map', name: 'mind-map', revision: 'builtin', dependencies_ready: true },
+  });
+  expect(skillEvent).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'skill_activated',
+    data: {
+      skill_id: 'mind-map',
+      name: 'mind-map',
+      revision: 'builtin',
+      dependencies_ready: true,
+      prepared_dependencies: undefined,
+    },
+  });
+
+  const recFail = parseRunEvent({
+    ...base,
+    type: 'tool_failed',
+    data: {
+      tool_call_id: 'c-py',
+      code: 'RUNTIME_EXIT_NONZERO',
+      message: 'SyntaxError',
+      tool_category: 'runtime',
+      recoverable: true,
+      duration_ms: 120,
+    },
+  });
+  expect(recFail).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'tool_failed',
+    data: {
+      tool_call_id: 'c-py',
+      code: 'RUNTIME_EXIT_NONZERO',
+      message: 'SyntaxError',
+      tool_category: 'runtime',
+      recoverable: true,
+      duration_ms: 120,
+    },
+  });
+
+  const artEvent = parseRunEvent({
+    ...base,
+    type: 'artifact_created',
+    data: {
+      artifact_id: 'art-1',
+      filename: 'mindmap.png',
+      title: '知识思维导图',
+      media_type: 'image/png',
+      size_bytes: 24576,
+      status: 'staged',
+    },
+  });
+  expect(artEvent).toMatchObject({
+    type: 'artifact_created',
+    data: { artifact_id: 'art-1', filename: 'mindmap.png', media_type: 'image/png', size_bytes: 24576, status: 'staged' },
+  });
+
+  const completed = parseRunEvent({
+    ...base,
+    type: 'run_completed',
+    data: {
+      message_id: 'msg-1',
+      artifacts: [
+        { artifact_id: 'art-1', filename: 'mindmap.png', title: '导图', media_type: 'image/png', size_bytes: 24576, status: 'published' },
+      ],
+    },
+  });
+  expect(completed).toMatchObject({
+    type: 'run_completed',
+    data: {
+      message_id: 'msg-1',
+      artifacts: [{ artifact_id: 'art-1', filename: 'mindmap.png', status: 'published' }],
+    },
+  });
+});

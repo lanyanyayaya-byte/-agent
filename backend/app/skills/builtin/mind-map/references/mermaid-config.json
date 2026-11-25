@@ -1,0 +1,8 @@
+{
+  "theme": "default",
+  "fontFamily": "PingFang SC, Hiragino Sans GB, Songti SC, Microsoft YaHei, sans-serif",
+  "mindmap": {
+    "padding": 16,
+    "maxNodeWidth": 220
+  }
+}

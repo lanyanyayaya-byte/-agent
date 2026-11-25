@@ -20,6 +20,21 @@
     "allow-mcp-disconnect-server",
     "allow-mcp-refresh-tools",
     "allow-mcp-set-server-enabled",
-    "allow-mcp-set-tool-permission"
+    "allow-mcp-set-tool-permission",
+    "allow-select-and-import-workspace-file",
+    "allow-select-and-import-workspace-files",
+    "allow-import-dropped-workspace-files",
+    "allow-delete-workspace-file",
+    "allow-open-artifact",
+    "allow-reveal-artifact-in-finder",
+    "allow-export-artifact",
+    "allow-runtime-prepare",
+    "allow-skills-preview-github",
+    "allow-skills-pick-and-preview-local",
+    "allow-skills-install-from-preview",
+    "allow-skills-set-enabled",
+    "allow-skills-update",
+    "allow-skills-prepare",
+    "allow-skills-delete"
   ]
 }

@@ -1,10 +1,11 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { connectApiClient, type ApiClient, type BackendStatus, type McpSummary } from './api/apiClient';
+import { connectApiClient, type ApiClient, type BackendStatus, type McpSummary, type SkillView } from './api/apiClient';
 import Chat from './Chat';
 import LibraryPanel from './LibraryPanel';
 import McpPanel from './McpPanel';
 import ModelSettings, { type CredentialProvider } from './ModelSettings';
+import SkillsPanel from './SkillsPanel';
 import './styles.css';
 
 type ConnectionState =
@@ -44,7 +45,7 @@ export default function App() {
 }
 
 function DesktopWorkspace() {
-  const [panel, setPanel] = useState<'chat' | 'library' | 'mcp'>('chat');
+  const [panel, setPanel] = useState<'chat' | 'library' | 'mcp' | 'skills'>('chat');
   const [connection, setConnection] = useState<ConnectionState>({ phase: 'starting_sidecar' });
   const [attempt, setAttempt] = useState(0);
   const credentialRevision = useRef(0);
@@ -52,6 +53,7 @@ function DesktopWorkspace() {
   const [logError, setLogError] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mcpSummary, setMcpSummary] = useState<McpSummary>();
+  const [skills, setSkills] = useState<SkillView[]>([]);
   const mcpSummarySeq = useRef(0);
   const mcpSummaryPollCount = useRef(0);
   const autoOpenedSettings = useRef(false);
@@ -144,12 +146,18 @@ function DesktopWorkspace() {
   useEffect(() => {
     if (!client) {
       setMcpSummary(undefined);
+      setSkills([]);
       mcpSummaryPollCount.current = 0;
       return;
     }
     mcpSummaryPollCount.current = 0;
     const controller = new AbortController();
     refreshMcpSummary(client, controller.signal);
+    void client.listSkills(controller.signal).then((list) => {
+      if (!controller.signal.aborted && Array.isArray(list)) setSkills(list);
+    }).catch(() => {
+      // Skills summary failure must never disrupt chat startup.
+    });
     return () => controller.abort();
   }, [client, panel, refreshMcpSummary]);
 
@@ -233,6 +241,20 @@ function DesktopWorkspace() {
                     : `已连接 ${mcpSummary.connected_servers} 个服务`
                 }>
                 {mcpSummary.connected_servers}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className="nav-item"
+            aria-controls="skills-panel"
+            aria-pressed={panel === 'skills'}
+            onClick={() => setPanel('skills')}>
+            <span className="nav-icon" aria-hidden="true">🧩</span>
+            <span>Skills</span>
+            {skills.filter((s) => s.enabled).length > 0 && (
+              <span className="nav-badge" title={`已启用 ${skills.filter((s) => s.enabled).length} 个技能`}>
+                {skills.filter((s) => s.enabled).length}
               </span>
             )}
           </button>
@@ -345,7 +367,9 @@ function DesktopWorkspace() {
             defaultRagEnabled
             autoTitleSessions
             mcpSummary={mcpSummary ?? null}
+            skills={skills}
             onOpenMcpPanel={() => setPanel('mcp')}
+            onOpenSkillsPanel={() => setPanel('skills')}
           />
         </div>
         <div id="library-panel" className="workspace-panel library-workspace-panel" hidden={panel !== 'library'}>
@@ -360,6 +384,13 @@ function DesktopWorkspace() {
             client={client}
             active={panel === 'mcp'}
             onSummaryChange={setMcpSummary}
+          />
+        </div>
+        <div id="skills-panel" className="workspace-panel skills-workspace-panel" hidden={panel !== 'skills'}>
+          <SkillsPanel
+            client={client}
+            active={panel === 'skills'}
+            onSkillsChange={setSkills}
           />
         </div>
       </div>

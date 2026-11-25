@@ -42,6 +42,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const WORKSPACE_HOST_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_PREPARE_TIMEOUT: Duration = Duration::from_secs(360);
 const EMBEDDING_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1142,6 +1144,136 @@ impl HostConnection {
             return Err(parsed.error.code);
         }
         Err("MCP_REQUEST_FAILED".to_owned())
+    }
+
+    pub(crate) async fn import_workspace_file(
+        &self,
+        session_id: Uuid,
+        path: &str,
+    ) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/sessions/{session_id}/workspace/files"),
+            Some(&json!({ "path": path })),
+            WORKSPACE_HOST_TIMEOUT,
+            "host_workspace_import_file",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_workspace_file(
+        &self,
+        session_id: Uuid,
+        file_id: Uuid,
+    ) -> Result<(), String> {
+        let _ = self
+            .mcp_request_json(
+                Method::DELETE,
+                &format!("/api/v1/_host/sessions/{session_id}/workspace/files/{file_id}"),
+                None,
+                WORKSPACE_HOST_TIMEOUT,
+                "host_workspace_delete_file",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_artifact_host_path(
+        &self,
+        session_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::GET,
+            &format!("/api/v1/_host/sessions/{session_id}/artifacts/{artifact_id}/path"),
+            None,
+            WORKSPACE_HOST_TIMEOUT,
+            "host_artifact_path",
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_runtime(&self, body: &Value) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            "/api/v1/_host/runtime/prepare",
+            Some(body),
+            RUNTIME_PREPARE_TIMEOUT,
+            "host_runtime_prepare",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_import_preview(&self, body: &Value) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            "/api/v1/_host/skills/import-preview",
+            Some(body),
+            Duration::from_secs(150),
+            "host_skills_import_preview",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_install(&self, body: &Value) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            "/api/v1/_host/skills/install",
+            Some(body),
+            Duration::from_secs(60),
+            "host_skills_install",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_set_enabled(
+        &self,
+        skill_id: &str,
+        enabled: bool,
+    ) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::PATCH,
+            &format!("/api/v1/_host/skills/{skill_id}"),
+            Some(&json!({ "enabled": enabled })),
+            WORKSPACE_HOST_TIMEOUT,
+            "host_skills_set_enabled",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_update(&self, skill_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/skills/{skill_id}/update"),
+            None,
+            Duration::from_secs(150),
+            "host_skills_update",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_prepare(&self, skill_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/skills/{skill_id}/prepare"),
+            None,
+            RUNTIME_PREPARE_TIMEOUT,
+            "host_skills_prepare",
+        )
+        .await
+    }
+
+    pub(crate) async fn skills_delete(&self, skill_id: &str) -> Result<(), String> {
+        let _ = self
+            .mcp_request_json(
+                Method::DELETE,
+                &format!("/api/v1/_host/skills/{skill_id}"),
+                None,
+                WORKSPACE_HOST_TIMEOUT,
+                "host_skills_delete",
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn get_mcp_server(&self, server_id: &str) -> Result<Value, String> {

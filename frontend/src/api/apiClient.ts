@@ -1,8 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
-import { parseRunEvent, type ParseWarning, type RunEvent, type StoredCitation } from './chatEvents';
+import {
+  parseRunEvent,
+  type ArtifactSummary,
+  type ParseWarning,
+  type RunEvent,
+  type StoredCitation,
+  type ToolCategory,
+} from './chatEvents';
 import { readSse } from './sse';
 
-export type { ParseWarning, StoredCitation };
+export type { ArtifactSummary, ParseWarning, StoredCitation, ToolCategory };
 export type RetrievalMode = 'keyword' | 'vector' | 'hybrid';
 export type CoverageMode = 'global' | 'per_document';
 export type ChannelStatus = 'hybrid' | 'keyword_only' | 'vector_only' | 'partial' | 'unavailable';
@@ -82,6 +89,144 @@ export type KnowledgeQueryOptions = {
 export type McpRunOptions = {
   enabled: boolean;
   allow_external_data_egress: boolean;
+};
+
+export type SkillsRunOptions = {
+  enabled: boolean;
+  selected_skill_ids?: string[];
+};
+
+export type SkillSourceType = 'builtin' | 'local' | 'github';
+
+export type SkillDependencyStatus = {
+  ready: boolean;
+  missing_python_packages: string[];
+  missing_node_tools: string[];
+  missing_system_commands: string[];
+  can_auto_prepare: boolean;
+  summary: string;
+};
+
+export type SkillView = {
+  skill_id: string;
+  name: string;
+  description: string;
+  source_type: SkillSourceType;
+  source_url: string | null;
+  revision: string;
+  enabled: boolean;
+  ready: boolean;
+  dependency_status: SkillDependencyStatus;
+  warnings: string[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type SkillResourceEntry = {
+  relative_path: string;
+  kind: 'script' | 'reference' | 'asset' | 'other';
+  size_bytes: number;
+};
+
+export type SkillDetailView = SkillView & {
+  license: string | null;
+  compatibility: string | null;
+  allowed_tools: string[];
+  extra_frontmatter: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  instructions: string;
+  resources: SkillResourceEntry[];
+};
+
+export type SkillImportCandidate = {
+  relative_path: string;
+  name: string;
+  description: string;
+  license: string | null;
+  compatibility: string | null;
+  resource_count: number;
+  dependency_status: SkillDependencyStatus;
+  required_python_packages: string[];
+  required_node_tools: string[];
+  required_system_commands: string[];
+  warnings: string[];
+  compatibility_notes: string[];
+  existing_skill_id: string | null;
+};
+
+export type SkillImportPreview = {
+  preview_id: string;
+  source_kind: 'github' | 'local_dir' | 'local_zip';
+  source_url: string;
+  resolved_ref: string | null;
+  commit_sha: string | null;
+  subpath: string | null;
+  candidates: SkillImportCandidate[];
+};
+
+export type ToolProbe = {
+  available: boolean;
+  path: string | null;
+  version: string | null;
+  source: string | null;
+};
+
+export type RuntimeStatus = {
+  runtime_dir: string;
+  venv_path: string;
+  venv_ready: boolean;
+  venv_python: string | null;
+  installed_python_packages: Record<string, string>;
+  puppeteer_config_path: string | null;
+  uv: ToolProbe;
+  python: ToolProbe;
+  node: ToolProbe;
+  npm: ToolProbe;
+  npx: ToolProbe;
+  git: ToolProbe;
+  chrome: ToolProbe;
+  mermaid_cli: ToolProbe;
+  shell: ToolProbe;
+  warnings: string[];
+};
+
+export type WorkspaceFileView = {
+  file_id: string;
+  session_id: string;
+  original_name: string;
+  relative_path: string;
+  media_type: string;
+  size_bytes: number;
+  created_at: string;
+  file_exists?: boolean;
+};
+
+export type StoredArtifact = {
+  artifact_id: string;
+  session_id: string;
+  run_id: string;
+  filename: string;
+  title: string | null;
+  relative_path: string;
+  media_type: string;
+  size_bytes: number;
+  status: 'staged' | 'published' | 'discarded';
+  created_at: string;
+  file_exists?: boolean;
+};
+
+export type StoredSkillActivation = {
+  activation_id: string;
+  skill_id: string;
+  name_snapshot: string;
+  revision: string;
+  activated_at: string;
+};
+
+export type SessionWorkspaceView = {
+  session_id: string;
+  files: WorkspaceFileView[];
+  artifacts: StoredArtifact[];
 };
 
 export type McpTransportKind = 'stdio' | 'streamable_http';
@@ -215,6 +360,8 @@ export type ToolCallSummary = {
   summary: string | null;
   error_code: string | null;
   source?: 'native' | 'mcp';
+  tool_category?: ToolCategory | null;
+  recoverable?: boolean;
   server_id?: string | null;
   server_name?: string | null;
   original_tool_name?: string | null;
@@ -312,8 +459,11 @@ export type RunStatus = {
 };
 export type RunSummary = Omit<RunStatus, 'pending_approval'> & {
   user_message_id: string;
+  error_message?: string | null;
   tool_calls?: ToolCallSummary[];
   citations?: StoredCitation[];
+  artifacts?: StoredArtifact[];
+  skill_activations?: StoredSkillActivation[];
 };
 type RunPage = { items: RunSummary[]; next_cursor: string | null };
 type CancelResult =
@@ -374,7 +524,12 @@ export function mcpErrorMessage(error: unknown, fallback: string): string {
     case 'MCP_CALL_ABORTED': return '同轮前置工具调用已失败，已中止后续外部 MCP 调用。';
     case 'MCP_TOOL_LIMIT_EXCEEDED': return '当前有效授权工具数量或 Schema 体积超过单轮上限（32 个 / 128 KiB），请前往 MCP 服务页面精简授权工具。';
     case 'MCP_EGRESS_AUTHORIZATION_REQUIRED': return '当前对话包含受保护的本地文件、教材检索或不可验证的历史上下文，需显式授权本轮数据外发后才能启用 MCP。';
-    case 'RUN_TIMEOUT': return '本轮对话执行总时长已超过上限（300 秒）。';
+    case 'RUN_TIMEOUT': return '本轮对话执行总时长已超过上限。';
+    case 'SKILL_REPEAT_FAILURE_LIMIT': return '脚本或工具连续出现相同错误达到上限，请调整需求或检查依赖后重试。';
+    case 'SKILL_INVALID_SOURCE': return '来源地址或压缩包格式无效，请检查 GitHub 链接或本地文件。';
+    case 'SKILL_NOT_FOUND': return '未在来源中发现有效的 SKILL.md 技能目录。';
+    case 'SKILL_IMPORT_FAILED': return '下载或解包技能来源失败，请检查网络连接或仓库地址。';
+    case 'SKILL_PREVIEW_EXPIRED': return '导入预览已过期，请重新获取技能列表。';
     case 'BACKEND_SIDECAR_UNAVAILABLE':
     case 'BACKEND_SHUTTING_DOWN':
     case 'SIDECAR_NOT_READY': return '桌面后端暂不可用，请检查连接状态后重试。';
@@ -442,6 +597,114 @@ export function mcpSetServerEnabled(serverId: string, enabled: boolean): Promise
 
 export function mcpSetToolPermission(request: SetMcpToolPermissionRequest): Promise<McpToolView> {
   return invoke<McpToolView>('mcp_set_tool_permission', { request });
+}
+
+// ---------------------------------------------------------------------------
+// Privileged Workspace, Artifact, Runtime & Skills Tauri IPC Wrappers
+// ---------------------------------------------------------------------------
+
+export function selectAndImportWorkspaceFiles(sessionId: string): Promise<WorkspaceFileView[]> {
+  return invoke<WorkspaceFileView[]>('select_and_import_workspace_files', {
+    request: { session_id: sessionId },
+  });
+}
+
+export function importDroppedWorkspaceFiles(sessionId: string, paths: string[]): Promise<WorkspaceFileView[]> {
+  return invoke<WorkspaceFileView[]>('import_dropped_workspace_files', {
+    request: { session_id: sessionId, paths },
+  });
+}
+
+export function deleteWorkspaceFile(sessionId: string, fileId: string): Promise<void> {
+  return invoke<void>('delete_workspace_file', {
+    request: { session_id: sessionId, file_id: fileId },
+  });
+}
+
+export function openArtifact(sessionId: string, artifactId: string): Promise<void> {
+  return invoke<void>('open_artifact', {
+    request: { session_id: sessionId, artifact_id: artifactId },
+  });
+}
+
+export function revealArtifactInFinder(sessionId: string, artifactId: string): Promise<void> {
+  return invoke<void>('reveal_artifact_in_finder', {
+    request: { session_id: sessionId, artifact_id: artifactId },
+  });
+}
+
+export function exportArtifact(sessionId: string, artifactId: string): Promise<{ exported: boolean; filename: string } | null> {
+  return invoke<{ exported: boolean; filename: string } | null>('export_artifact', {
+    request: { session_id: sessionId, artifact_id: artifactId },
+  });
+}
+
+export function runtimePrepare(request: {
+  python_packages?: string[];
+  install_mermaid_cli?: boolean;
+  ensure_python_venv?: boolean;
+  timeout_seconds?: number;
+}): Promise<{ ok: boolean; status: RuntimeStatus; steps: { step: string; ok: boolean; message: string; duration_ms: number }[] }> {
+  return invoke('runtime_prepare', { request });
+}
+
+export function skillsPreviewGithub(url: string, refName?: string, subpath?: string): Promise<SkillImportPreview> {
+  return invoke<SkillImportPreview>('skills_preview_github', {
+    request: {
+      url,
+      ...(refName?.trim() ? { ref_name: refName.trim() } : {}),
+      ...(subpath?.trim() ? { subpath: subpath.trim() } : {}),
+    },
+  });
+}
+
+export function skillsPickAndPreviewLocal(mode: 'directory' | 'zip'): Promise<SkillImportPreview | null> {
+  return invoke<SkillImportPreview | null>('skills_pick_and_preview_local', {
+    request: { mode },
+  });
+}
+
+export function skillsInstallFromPreview(
+  previewId: string,
+  selectedRelativePaths: string[],
+  enabled = true,
+): Promise<{ skills: SkillView[] }> {
+  return invoke<{ skills: SkillView[] }>('skills_install_from_preview', {
+    request: {
+      preview_id: previewId,
+      selected_relative_paths: selectedRelativePaths,
+      enabled,
+      replace_existing: true,
+    },
+  });
+}
+
+export function skillsSetEnabled(skillId: string, enabled: boolean): Promise<SkillView> {
+  return invoke<SkillView>('skills_set_enabled', {
+    request: { skill_id: skillId, enabled },
+  });
+}
+
+export function skillsUpdate(skillId: string): Promise<SkillView> {
+  return invoke<SkillView>('skills_update', {
+    request: { skill_id: skillId },
+  });
+}
+
+export function skillsPrepare(skillId: string): Promise<{
+  ok: boolean;
+  dependency_status: SkillDependencyStatus;
+  skill: SkillView;
+}> {
+  return invoke('skills_prepare', {
+    request: { skill_id: skillId },
+  });
+}
+
+export function skillsDelete(skillId: string): Promise<void> {
+  return invoke<void>('skills_delete', {
+    request: { skill_id: skillId },
+  });
 }
 
 async function requireSuccess(response: Response) {
@@ -624,6 +887,28 @@ export async function connectApiClient() {
     getMcpSummary(signal: AbortSignal): Promise<McpSummary> {
       return readJson('/mcp/summary', signal);
     },
+    listSkills(signal: AbortSignal): Promise<SkillView[]> {
+      return readJson('/skills', signal);
+    },
+    getSkillDetail(skillId: string, signal: AbortSignal): Promise<SkillDetailView> {
+      return readJson(`/skills/${encodeURIComponent(skillId)}`, signal);
+    },
+    getRuntimeStatus(signal: AbortSignal): Promise<RuntimeStatus> {
+      return readJson('/runtime/status', signal);
+    },
+    getSessionWorkspace(sessionId: string, signal: AbortSignal): Promise<SessionWorkspaceView> {
+      return readJson(`/sessions/${encodeURIComponent(sessionId)}/workspace`, signal);
+    },
+    async fetchArtifactBlob(sessionId: string, artifactId: string, signal: AbortSignal): Promise<Blob> {
+      const response = await request(
+        `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+        'GET',
+        AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+        { accept: '*/*' },
+      );
+      await requireSuccess(response);
+      return await response.blob();
+    },
     getDocument(documentId: string, signal: AbortSignal): Promise<DocumentDetails> {
       return readJson(`/knowledge/documents/${encodeURIComponent(documentId)}`, signal);
     },
@@ -697,6 +982,9 @@ export async function connectApiClient() {
       signal: AbortSignal, onEvent: (event: RunEvent) => void,
       knowledge?: KnowledgeQueryOptions,
       mcp?: McpRunOptions,
+      skills?: SkillsRunOptions,
+      attachmentIds?: string[],
+      artifactIds?: string[],
     ): Promise<void> {
       const response = await request(`/sessions/${encodeURIComponent(sessionId)}/runs/stream`, 'POST', signal, {
         accept: 'text/event-stream',
@@ -705,6 +993,9 @@ export async function connectApiClient() {
           message,
           ...(knowledge ? { knowledge } : {}),
           ...(mcp ? { mcp } : {}),
+          ...(skills ? { skills } : {}),
+          ...(attachmentIds && attachmentIds.length > 0 ? { attachment_ids: attachmentIds } : {}),
+          ...(artifactIds && artifactIds.length > 0 ? { artifact_ids: artifactIds } : {}),
         },
       });
       await requireSuccess(response);

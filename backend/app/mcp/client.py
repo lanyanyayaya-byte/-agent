@@ -62,7 +62,7 @@ from app.mcp.process_registry import McpProcessRegistry
 
 logger = logging.getLogger("knowledgeagent.mcp.client")
 
-CLIENT_INFO = types.Implementation(name="KnowledgeAgent", version="0.3.0")
+CLIENT_INFO = types.Implementation(name="KnowledgeAgent", version="0.4.0")
 
 # JSON-RPC / MCP error codes defined by mcp_types
 _PARSE_ERROR = getattr(types, "PARSE_ERROR", -32700)

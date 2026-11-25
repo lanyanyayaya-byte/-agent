@@ -8,10 +8,13 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, Huma
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import get_checkpoint_id
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphRecursionError
 from langsmith import tracing_context
 
+from app.agent.budgets import SKILLS_RECURSION_LIMIT
 from app.agent.tool_graph import build_tool_graph, paired_tool_calls
 from app.models import ModelError
+from app.tools.protocol import ERROR_MESSAGES
 from app.tools.registry import RunTools
 
 EMPTY_CHECKPOINT_ID = "00000000-0000-0000-0000-000000000000"
@@ -88,14 +91,20 @@ async def _checkpointed_answer(graph, inputs, config, on_delta, tools: RunTools 
 
     final_config = None
     modes = ["checkpoints"] if tools is not None else ["messages", "checkpoints"]
-    async with aclosing(graph.astream(
-        inputs, config, stream_mode=modes, durability="sync",
-    )) as stream:
-        async for mode, event in stream:
-            if mode == "checkpoints":
-                final_config = event["config"]
-            else:
-                _emit_delta(event, on_delta)
+    effective_config: RunnableConfig = dict(config or {})
+    if tools is not None and tools.has_skills_tools:
+        effective_config.setdefault("recursion_limit", SKILLS_RECURSION_LIMIT)
+    try:
+        async with aclosing(graph.astream(
+            inputs, effective_config, stream_mode=modes, durability="sync",
+        )) as stream:
+            async for mode, event in stream:
+                if mode == "checkpoints":
+                    final_config = event["config"]
+                else:
+                    _emit_delta(event, on_delta)
+    except GraphRecursionError:
+        raise ModelError("RATE_LIMITED", ERROR_MESSAGES["RATE_LIMITED"]) from None
 
     if tools is not None and tools.failure is not None:
         raise ModelError(tools.failure.error_code, tools.failure.display_summary)

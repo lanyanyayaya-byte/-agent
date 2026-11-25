@@ -27,9 +27,26 @@ export type StoredCitation = {
 };
 
 export type ToolSource = 'native' | 'mcp';
+export type ToolCategory = 'skill' | 'workspace' | 'runtime';
+
+export type ArtifactSummary = {
+  artifact_id: string;
+  session_id?: string;
+  run_id?: string;
+  filename: string;
+  title: string | null;
+  relative_path?: string;
+  media_type: string;
+  size_bytes: number;
+  status: 'staged' | 'published' | 'discarded';
+  created_at?: string;
+  file_exists?: boolean;
+};
 
 export type ToolEventMetadata = {
   source?: ToolSource;
+  tool_category?: ToolCategory | null;
+  recoverable?: boolean;
   server_id?: string | null;
   server_name?: string | null;
   original_tool_name?: string | null;
@@ -43,6 +60,20 @@ export type RunEvent = Envelope & (
   | { type: 'tool_completed'; data: { tool_call_id: string; summary: string } & ToolEventMetadata }
   | { type: 'tool_failed'; data: { tool_call_id: string; code: string; message: string } & ToolEventMetadata }
   | {
+      type: 'skill_activated';
+      data: {
+        skill_id: string;
+        name: string;
+        revision: string;
+        dependencies_ready?: boolean;
+        prepared_dependencies?: boolean;
+      };
+    }
+  | {
+      type: 'artifact_created';
+      data: ArtifactSummary;
+    }
+  | {
       type: 'run_citations';
       data: {
         citations: StoredCitation[];
@@ -51,7 +82,7 @@ export type RunEvent = Envelope & (
         channel_status: string;
       };
     }
-  | { type: 'run_completed'; data: { message_id: string } }
+  | { type: 'run_completed'; data: { message_id: string; artifacts?: ArtifactSummary[] } }
   | { type: 'error'; data: { code: string; message: string } }
   | { type: 'run_cancelled'; data: { reason: string } }
 );
@@ -63,6 +94,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function parseToolMetadata(data: Record<string, unknown>, includeDuration: boolean): ToolEventMetadata {
   const meta: ToolEventMetadata = {};
   if (data.source === 'native' || data.source === 'mcp') meta.source = data.source;
+  if (data.tool_category === 'skill' || data.tool_category === 'workspace' || data.tool_category === 'runtime'
+    || data.tool_category === null) {
+    meta.tool_category = data.tool_category;
+  }
+  if (typeof data.recoverable === 'boolean') meta.recoverable = data.recoverable;
   if (typeof data.server_id === 'string' || data.server_id === null) meta.server_id = data.server_id;
   if (typeof data.server_name === 'string' || data.server_name === null) meta.server_name = data.server_name;
   if (typeof data.original_tool_name === 'string' || data.original_tool_name === null) {
@@ -72,6 +108,25 @@ function parseToolMetadata(data: Record<string, unknown>, includeDuration: boole
     meta.duration_ms = data.duration_ms;
   }
   return meta;
+}
+
+function parseArtifactSummary(value: unknown): ArtifactSummary | undefined {
+  if (!isRecord(value) || typeof value.artifact_id !== 'string' || typeof value.filename !== 'string') {
+    return;
+  }
+  return {
+    artifact_id: value.artifact_id,
+    session_id: typeof value.session_id === 'string' ? value.session_id : undefined,
+    run_id: typeof value.run_id === 'string' ? value.run_id : undefined,
+    filename: value.filename,
+    title: typeof value.title === 'string' ? value.title : null,
+    relative_path: typeof value.relative_path === 'string' ? value.relative_path : undefined,
+    media_type: typeof value.media_type === 'string' ? value.media_type : 'application/octet-stream',
+    size_bytes: typeof value.size_bytes === 'number' ? value.size_bytes : 0,
+    status: value.status === 'published' || value.status === 'discarded' ? value.status : 'staged',
+    created_at: typeof value.created_at === 'string' ? value.created_at : undefined,
+    file_exists: typeof value.file_exists === 'boolean' ? value.file_exists : undefined,
+  };
 }
 
 export function parseRunEvent(value: unknown): RunEvent | undefined {
@@ -134,6 +189,28 @@ export function parseRunEvent(value: unknown): RunEvent | undefined {
         };
       }
       break;
+    case 'skill_activated':
+      if (typeof data.skill_id === 'string' && typeof data.name === 'string') {
+        return {
+          ...envelope,
+          type,
+          data: {
+            skill_id: data.skill_id,
+            name: data.name,
+            revision: typeof data.revision === 'string' ? data.revision : '',
+            dependencies_ready: typeof data.dependencies_ready === 'boolean' ? data.dependencies_ready : undefined,
+            prepared_dependencies: typeof data.prepared_dependencies === 'boolean' ? data.prepared_dependencies : undefined,
+          },
+        };
+      }
+      break;
+    case 'artifact_created': {
+      const artifact = parseArtifactSummary(data);
+      if (artifact) {
+        return { ...envelope, type, data: artifact };
+      }
+      break;
+    }
     case 'run_citations':
       if (Array.isArray(data.citations)) {
         return {
@@ -150,7 +227,17 @@ export function parseRunEvent(value: unknown): RunEvent | undefined {
       break;
     case 'run_completed':
       if (typeof data.message_id === 'string' && data.message_id) {
-        return { ...envelope, type, data: { message_id: data.message_id } };
+        const artifacts = Array.isArray(data.artifacts)
+          ? data.artifacts.map(parseArtifactSummary).filter((a): a is ArtifactSummary => Boolean(a))
+          : undefined;
+        return {
+          ...envelope,
+          type,
+          data: {
+            message_id: data.message_id,
+            ...(artifacts && artifacts.length > 0 ? { artifacts } : {}),
+          },
+        };
       }
       break;
     case 'error':

@@ -130,11 +130,11 @@ def test_v5_to_v6_migration_preserves_all_legacy_data_and_is_idempotent(tmp_path
     path = tmp_path / "business.sqlite3"
     ids = _create_v5_database(path)
 
-    # Upgrade V5 -> V6
+    # Upgrade V5 -> latest (V6+V7)
     store = BusinessStore(path)
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION >= 6
     with closing(store._connect()) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (6,)
+        assert db.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -185,7 +185,7 @@ def test_fresh_v6_schema_constraints_and_future_version_rejection(tmp_path):
     store = BusinessStore(path)
 
     with closing(store._connect()) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (6,)
+        assert db.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
         # CHECK: stdio requires command and forbids url
         with pytest.raises(sqlite3.IntegrityError):
             db.execute(
@@ -216,9 +216,9 @@ def test_fresh_v6_schema_constraints_and_future_version_rejection(tmp_path):
                    VALUES ('s4', 'validhttp', 'streamable_http', 'https://other.example', 't', 't')"""
             )
 
-    # Simulate an older app binary encountering a newer database version (V7 > V6).
+    # Simulate an older app binary encountering a newer database version.
     with closing(sqlite3.connect(path)) as db, db:
-        db.execute("PRAGMA user_version=7")
+        db.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
     with pytest.raises(RuntimeError, match="Unsupported business database schema version"):
         BusinessStore(path)
 
