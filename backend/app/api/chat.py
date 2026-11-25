@@ -16,7 +16,9 @@ from app.models import ModelError
 from app.security import ApiError
 from app.services.hybrid_retrieval import CoverageMode, MAX_COMPARISON_DOCUMENTS, RetrievalMode
 from app.services.library import DOCUMENT_ID_PATTERN
-from app.services.runs import KnowledgeRunConfig, RunNotCancellable, RunService, RunServiceStopping, RunStream
+from app.services.runs import (
+    KnowledgeRunConfig, McpRunConfig, RunNotCancellable, RunService, RunServiceStopping, RunStream,
+)
 from app.storage.business import (
     BusinessStore, Message, RunConflict, RunNotFound, RunStatus, RunSummary, Session, SessionNotFound,
     SessionSummary,
@@ -51,6 +53,13 @@ class KnowledgeQueryOptions(BaseModel):
     top_k: Annotated[int, Field(ge=1, le=20)] = 6
 
 
+class McpRunOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool = False
+    allow_external_data_egress: bool = False
+
+
 class StartRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -61,6 +70,7 @@ class StartRun(BaseModel):
         AfterValidator(validate_utf8),
     ]
     knowledge: KnowledgeQueryOptions | None = None
+    mcp: McpRunOptions | None = None
 
 
 class RunPage(BaseModel):
@@ -193,11 +203,18 @@ def chat_router(runs: RunService, store: BusinessStore, require_ui, require_read
                 coverage_mode=body.knowledge.coverage_mode,
                 top_k=body.knowledge.top_k,
             )
+        mcp_cfg: McpRunConfig | None = None
+        if body.mcp is not None:
+            mcp_cfg = McpRunConfig(
+                enabled=body.mcp.enabled,
+                allow_external_data_egress=body.mcp.allow_external_data_egress,
+            )
         try:
             stream = await runs.start(
                 str(session_id), str(body.client_request_id), body.message,
                 request_id=request.state.request_id,
                 **({"knowledge": knowledge_cfg} if knowledge_cfg is not None else {}),
+                **({"mcp": mcp_cfg} if mcp_cfg is not None else {}),
             )
         except SessionNotFound:
             raise ApiError(404, "NOT_FOUND", "未找到该会话。") from None
@@ -206,7 +223,11 @@ def chat_router(runs: RunService, store: BusinessStore, require_ui, require_read
                        else "此会话有正在执行的任务。")
             raise ApiError(409, error.code, message, run_id=error.run_id) from None
         except ModelError as error:
-            raise ApiError(503, error.code, str(error)) from None
+            status_code = {
+                "MCP_EGRESS_AUTHORIZATION_REQUIRED": 403,
+                "MCP_TOOL_LIMIT_EXCEEDED": 409,
+            }.get(error.code, 503)
+            raise ApiError(status_code, error.code, str(error)) from None
         except RunServiceStopping:
             raise ApiError(503, "SIDECAR_NOT_READY", "后端正在关闭。") from None
         request.state.run_id = stream.run.run_id

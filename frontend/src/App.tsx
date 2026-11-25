@@ -1,8 +1,9 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { useEffect, useRef, useState } from 'react';
-import { connectApiClient, type ApiClient, type BackendStatus } from './api/apiClient';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { connectApiClient, type ApiClient, type BackendStatus, type McpSummary } from './api/apiClient';
 import Chat from './Chat';
 import LibraryPanel from './LibraryPanel';
+import McpPanel from './McpPanel';
 import ModelSettings, { type CredentialProvider } from './ModelSettings';
 import './styles.css';
 
@@ -43,13 +44,16 @@ export default function App() {
 }
 
 function DesktopWorkspace() {
-  const [panel, setPanel] = useState<'chat' | 'library'>('chat');
+  const [panel, setPanel] = useState<'chat' | 'library' | 'mcp'>('chat');
   const [connection, setConnection] = useState<ConnectionState>({ phase: 'starting_sidecar' });
   const [attempt, setAttempt] = useState(0);
   const credentialRevision = useRef(0);
   const [logPending, setLogPending] = useState(false);
   const [logError, setLogError] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mcpSummary, setMcpSummary] = useState<McpSummary>();
+  const mcpSummarySeq = useRef(0);
+  const mcpSummaryPollCount = useRef(0);
   const autoOpenedSettings = useRef(false);
 
   useEffect(() => {
@@ -126,6 +130,47 @@ function DesktopWorkspace() {
   const client = connection.phase === 'ready' ? connection.client : undefined;
   const needsSetup = connection.phase === 'ready' && (!connection.status.model_configured || !!connection.siliconflowRestoreError);
 
+  const refreshMcpSummary = useCallback((api: ApiClient, signal?: AbortSignal) => {
+    const seq = ++mcpSummarySeq.current;
+    void api.getMcpSummary(signal ?? new AbortController().signal).then((summary) => {
+      if (!signal?.aborted && mcpSummarySeq.current === seq) {
+        setMcpSummary(summary);
+      }
+    }).catch(() => {
+      // MCP summary failures must never disrupt normal chat or workspace startup.
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!client) {
+      setMcpSummary(undefined);
+      mcpSummaryPollCount.current = 0;
+      return;
+    }
+    mcpSummaryPollCount.current = 0;
+    const controller = new AbortController();
+    refreshMcpSummary(client, controller.signal);
+    return () => controller.abort();
+  }, [client, panel, refreshMcpSummary]);
+
+  // While background startup auto-connect is still bringing up enabled MCP servers,
+  // refresh the summary periodically so sidebar badge & Chat panel reflect connected tools
+  // automatically without needing to visit the MCP panel first.
+  useEffect(() => {
+    if (!client || panel === 'mcp' || !mcpSummary) return;
+    const pendingAutoConnect = mcpSummary.enabled_servers > (mcpSummary.connected_servers + mcpSummary.error_servers);
+    if (!pendingAutoConnect || mcpSummaryPollCount.current >= 15) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      mcpSummaryPollCount.current += 1;
+      refreshMcpSummary(client, controller.signal);
+    }, 1500);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [client, panel, mcpSummary, refreshMcpSummary]);
+
   function changeCredentialStatus(provider: CredentialProvider, configured: boolean) {
     credentialRevision.current += 1;
     setConnection((previous) => {
@@ -170,6 +215,26 @@ function DesktopWorkspace() {
             onClick={() => setPanel('library')}>
             <span className="nav-icon" aria-hidden="true">📚</span>
             <span>教材知识库</span>
+          </button>
+          <button
+            type="button"
+            className="nav-item"
+            aria-controls="mcp-panel"
+            aria-pressed={panel === 'mcp'}
+            onClick={() => setPanel('mcp')}>
+            <span className="nav-icon" aria-hidden="true">🔌</span>
+            <span>MCP 服务</span>
+            {mcpSummary && (mcpSummary.connected_servers > 0 || mcpSummary.error_servers > 0) && (
+              <span
+                className={`nav-badge ${mcpSummary.error_servers > 0 ? 'has-error' : ''}`}
+                title={
+                  mcpSummary.error_servers > 0
+                    ? `已连接 ${mcpSummary.connected_servers} 个，异常 ${mcpSummary.error_servers} 个`
+                    : `已连接 ${mcpSummary.connected_servers} 个服务`
+                }>
+                {mcpSummary.connected_servers}
+              </span>
+            )}
           </button>
         </nav>
 
@@ -279,6 +344,8 @@ function DesktopWorkspace() {
             modelConfigured={connection.phase === 'ready' && connection.status.model_configured}
             defaultRagEnabled
             autoTitleSessions
+            mcpSummary={mcpSummary ?? null}
+            onOpenMcpPanel={() => setPanel('mcp')}
           />
         </div>
         <div id="library-panel" className="workspace-panel library-workspace-panel" hidden={panel !== 'library'}>
@@ -286,6 +353,13 @@ function DesktopWorkspace() {
             client={client}
             active={panel === 'library'}
             siliconflowConfigured={connection.phase === 'ready' && connection.status.siliconflow_configured === true}
+          />
+        </div>
+        <div id="mcp-panel" className="workspace-panel mcp-workspace-panel" hidden={panel !== 'mcp'}>
+          <McpPanel
+            client={client}
+            active={panel === 'mcp'}
+            onSummaryChange={setMcpSummary}
           />
         </div>
       </div>

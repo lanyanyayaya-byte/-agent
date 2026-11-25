@@ -23,8 +23,8 @@ stage="$desktop/target/packaging"
 p8_stage="$desktop/target/packaging"
 variant=$route
 config="$desktop/packaging/$route.json"
-entry="$backend/app/sidecar.py"
-version="0.1.0"
+entry="$desktop/packaging/sidecar_entry.py"
+version="0.3.0"
 custom_version=0
 
 if [[ $# -gt 1 ]]; then
@@ -42,6 +42,10 @@ UV_PROJECT_ENVIRONMENT="$stage/build-venv" uv run --project "$backend" \
     --python 3.12 --locked --no-dev --group packaging pyinstaller \
     "--$route" --console --target-arch arm64 --name "$name" --noconfirm \
     --recursive-copy-metadata pdfplumber --recursive-copy-metadata python-docx \
+    --recursive-copy-metadata mcp --recursive-copy-metadata mcp-types \
+    --hidden-import anyio._backends._asyncio \
+    --collect-data jsonschema_specifications \
+    --collect-data certifi \
     --paths "$backend" --distpath "$pyinstaller/$variant" \
     --workpath "$pyinstaller/work-$route" --specpath "$pyinstaller/spec-$route" \
     "$entry"
@@ -88,7 +92,7 @@ if [[ "$route" == onedir && "$variant" == onedir ]]; then
     p8_app="$p8_stage/apps/onedir/KnowledgeAgent.app"
     if [[ "$custom_version" -eq 1 ]]; then
         p8_app="$output"
-    else
+    elif [[ "$output" != "$p8_app" ]]; then
         mkdir -p "$(dirname "$p8_app")"
         rm -rf "$p8_app"
         ditto "$output" "$p8_app"

@@ -18,9 +18,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from app.mcp.models import McpError, McpServerConfig
+from app.mcp.models import McpError, McpServerConfig, TransportKind
 
 SERVER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -466,3 +466,514 @@ def redact_text(
     if len(sanitized) > max_chars:
         sanitized = sanitized[: max_chars - 1] + "…"
     return sanitized
+
+
+MAX_TOOL_SCHEMA_BYTES = 16 * 1024
+MAX_TOOL_SCHEMA_DEPTH = 6
+MAX_IMPORT_JSON_BYTES = 256 * 1024
+
+SUSPECTED_SECRET_KEY_PARTS: tuple[str, ...] = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "AUTH",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "COOKIE",
+    "PRIVATE",
+)
+
+STRICT_SECRET_HEADERS: frozenset[str] = frozenset({
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-auth-token",
+    "x-access-token",
+    "cookie",
+})
+
+SECRET_QUERY_KEYS: frozenset[str] = frozenset({
+    "api_key",
+    "apikey",
+    "api-key",
+    "token",
+    "access_token",
+    "auth",
+    "authorization",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "pwd",
+    "key",
+    "bearer",
+    "signature",
+    "sig",
+})
+
+SECRET_ARG_FLAGS: frozenset[str] = frozenset({
+    "--api-key",
+    "--apikey",
+    "--token",
+    "--access-token",
+    "--auth",
+    "--auth-token",
+    "--secret",
+    "--password",
+    "--passwd",
+    "--bearer",
+    "--header",
+    "-H",
+})
+
+GENERIC_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    SK_TOKEN_PATTERN,
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"(?i)^\s*bearer\s+\S{6,}\s*$"),
+    re.compile(r"(?i)^\s*basic\s+[A-Za-z0-9+/=]{8,}\s*$"),
+)
+
+
+def is_suspected_secret_key(key: str) -> bool:
+    upper = key.strip().upper()
+    if not upper:
+        return False
+    return any(part in upper for part in SUSPECTED_SECRET_KEY_PARTS)
+
+
+def looks_like_secret_value(value: str) -> bool:
+    if not value:
+        return False
+    return any(pattern.search(value) is not None for pattern in GENERIC_TOKEN_PATTERNS)
+
+
+def validate_secret_value(key: str, value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise McpError("MCP_INVALID_CONFIG", f"秘钥 {key} 不能为空。")
+    if "\x00" in value or "\r" in value or "\n" in value:
+        raise McpError("MCP_INVALID_CONFIG", f"秘钥 {key} 包含非法换行或空字符。")
+    if len(value.encode("utf-8")) > MAX_SECRET_VALUE_BYTES:
+        raise McpError("MCP_INVALID_CONFIG", f"秘钥 {key} 超过 {MAX_SECRET_VALUE_BYTES} 字节上限。")
+
+
+def check_secret_bypass(
+    *,
+    transport: TransportKind,
+    args: Iterable[str] = (),
+    url: str | None = None,
+    plain_env: Mapping[str, str] = {},
+    plain_headers: Mapping[str, str] = {},
+) -> None:
+    """Reject obvious attempts to store plaintext credentials outside macOS Keychain."""
+    if transport == "stdio":
+        args_list = list(args)
+        for index, arg in enumerate(args_list):
+            if looks_like_secret_value(arg):
+                raise McpError(
+                    "MCP_INVALID_CONFIG",
+                    "启动参数中检测到疑似明文秘钥，请改用钥匙串秘钥环境变量注入。",
+                )
+            lower = arg.lower()
+            if "=" in arg:
+                flag, val = arg.split("=", 1)
+                flag_lower = flag.strip().lower()
+                if val.strip() and (
+                    flag_lower in SECRET_ARG_FLAGS
+                    or (flag_lower.startswith("--") and is_suspected_secret_key(flag_lower.lstrip("-")))
+                ):
+                    raise McpError(
+                        "MCP_INVALID_CONFIG",
+                        f"启动参数 {flag} 疑似包含明文凭据，请改用钥匙串秘钥环境变量。",
+                    )
+            elif lower in SECRET_ARG_FLAGS or arg in SECRET_ARG_FLAGS:
+                if index + 1 < len(args_list) and args_list[index + 1].strip():
+                    raise McpError(
+                        "MCP_INVALID_CONFIG",
+                        f"启动参数 {arg} 疑似携带明文凭据，请改用钥匙串秘钥环境变量。",
+                    )
+        for key, value in plain_env.items():
+            if looks_like_secret_value(value):
+                raise McpError(
+                    "MCP_INVALID_CONFIG",
+                    f"明文环境变量 {key} 的值疑似包含秘钥，请勾选作为钥匙串秘钥存储。",
+                )
+    elif transport == "streamable_http":
+        if url:
+            parsed = urlsplit(url)
+            for q_key, q_val in parse_qsl(parsed.query, keep_blank_values=True):
+                if q_val and (q_key.strip().lower() in SECRET_QUERY_KEYS or looks_like_secret_value(q_val)):
+                    raise McpError(
+                        "MCP_INVALID_CONFIG",
+                        f"HTTP URL 查询参数 {q_key} 疑似包含明文凭据，请改用钥匙串秘钥 Header。",
+                    )
+        for key, value in plain_headers.items():
+            if key.strip().lower() in STRICT_SECRET_HEADERS or looks_like_secret_value(value):
+                raise McpError(
+                    "MCP_INVALID_CONFIG",
+                    f"HTTP Header {key} 疑似包含认证凭据，必须作为钥匙串秘钥存储。",
+                )
+
+
+def redact_args(args: Iterable[str], *, secrets: Iterable[str] = ()) -> tuple[str, ...]:
+    """Redact potential secret values in command-line arguments for UI/logs/trust dialogs."""
+    args_list = list(args)
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args_list:
+        if redact_next:
+            redacted.append("[REDACTED]")
+            redact_next = False
+            continue
+        if "=" in arg:
+            flag, val = arg.split("=", 1)
+            flag_lower = flag.strip().lower()
+            if (
+                flag_lower in SECRET_ARG_FLAGS
+                or (flag_lower.startswith("--") and is_suspected_secret_key(flag_lower.lstrip("-")))
+                or looks_like_secret_value(val)
+            ):
+                redacted.append(f"{flag}=[REDACTED]")
+                continue
+        if arg.lower() in SECRET_ARG_FLAGS or arg in SECRET_ARG_FLAGS:
+            redacted.append(arg)
+            redact_next = True
+            continue
+        if looks_like_secret_value(arg):
+            redacted.append("[REDACTED]")
+            continue
+        cleaned = redact_text(arg, secrets=secrets, max_chars=MAX_ARG_LENGTH)
+        redacted.append(cleaned)
+    return tuple(redacted)
+
+
+def redact_url(url: str, *, secrets: Iterable[str] = ()) -> str:
+    """Redact sensitive query parameters or embedded tokens from a URL for display."""
+    parsed = urlsplit(url)
+    if not parsed.query:
+        return redact_text(url, secrets=secrets, max_chars=2048)
+    safe_pairs: list[tuple[str, str]] = []
+    for key, val in parse_qsl(parsed.query, keep_blank_values=True):
+        if key.strip().lower() in SECRET_QUERY_KEYS or looks_like_secret_value(val):
+            safe_pairs.append((key, "REDACTED"))
+        else:
+            safe_pairs.append((key, redact_text(val, secrets=secrets, max_chars=512)))
+    rebuilt = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(safe_pairs), ""))
+    return redact_text(rebuilt, secrets=secrets, max_chars=2048)
+
+
+def inspect_high_risk_command(
+    command: str,
+    args: tuple[str, ...],
+    *,
+    resolved_executable: Path | None = None,
+) -> tuple[bool, tuple[str, ...]]:
+    """Inspect a stdio command for dynamic package execution or shell/interpreter risk."""
+    reasons: list[str] = []
+    exe_name = (resolved_executable.name if resolved_executable is not None else Path(command).name).lower()
+    if exe_name in ("npx", "uvx", "bunx", "pipx"):
+        reasons.append(f"使用动态包执行器 {exe_name}，运行时可能自动下载并执行远程代码包。")
+    elif exe_name in ("sh", "bash", "zsh", "osascript"):
+        reasons.append(f"使用系统脚本解释器 {exe_name}，可执行任意本机命令。")
+    elif exe_name == "docker":
+        reasons.append("使用 docker 启动外部容器进程，可能挂载本地目录或访问网络。")
+    if exe_name.startswith("python") and any(arg == "-c" for arg in args):
+        reasons.append("使用 python -c 内联执行脚本。")
+    if exe_name in ("node", "deno", "bun") and any(arg in ("-e", "--eval") for arg in args):
+        reasons.append(f"使用 {exe_name} 内联执行脚本。")
+    return bool(reasons), tuple(reasons)
+
+
+def is_private_network_url(url: str) -> bool:
+    """Return True if a literal IP in the URL belongs to a non-loopback private network."""
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname or hostname in LOOPBACK_HOSTNAMES:
+        return False
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_private and not ip.is_loopback
+
+
+def check_tool_schema_compatibility(input_schema: Any) -> tuple[bool, str | None]:
+    """Validate whether an MCP tool's inputSchema meets safety/DeepSeek compatibility rules."""
+    if not isinstance(input_schema, Mapping):
+        return False, "工具参数 Schema 必须为 JSON 对象。"
+    try:
+        serialized = canonical_json(dict(input_schema)).encode("utf-8")
+    except (TypeError, ValueError):
+        return False, "工具参数 Schema 无法序列化为标准 JSON。"
+    if len(serialized) > MAX_TOOL_SCHEMA_BYTES:
+        return False, f"工具参数 Schema 体积超过 {MAX_TOOL_SCHEMA_BYTES // 1024} KiB 上限。"
+
+    schema_type = input_schema.get("type")
+    if schema_type is not None and schema_type != "object":
+        return False, f"工具参数 Schema 顶层 type 必须为 object（当前为 {schema_type}）。"
+
+    defs: dict[str, Any] = {}
+    for defs_key in ("$defs", "definitions"):
+        raw_defs = input_schema.get(defs_key)
+        if isinstance(raw_defs, Mapping):
+            for k, v in raw_defs.items():
+                defs[f"#/{defs_key}/{k}"] = v
+
+    def _walk(node: Any, depth: int, active_refs: frozenset[str]) -> str | None:
+        if depth > MAX_TOOL_SCHEMA_DEPTH:
+            return f"工具参数 Schema 嵌套深度超过 {MAX_TOOL_SCHEMA_DEPTH} 层上限。"
+        if not isinstance(node, Mapping):
+            return None
+        ref = node.get("$ref")
+        if ref is not None:
+            if not isinstance(ref, str) or not ref.startswith("#/"):
+                return "工具参数 Schema 包含不支持的外部 $ref 引用。"
+            if ref in active_refs:
+                return "工具参数 Schema 包含循环 $ref 引用。"
+            target = defs.get(ref)
+            if target is None:
+                return f"工具参数 Schema 包含无法解析的本地引用: {ref}"
+            err = _walk(target, depth + 1, active_refs | {ref})
+            if err:
+                return err
+        props = node.get("properties")
+        if isinstance(props, Mapping):
+            for child in props.values():
+                err = _walk(child, depth + 1, active_refs)
+                if err:
+                    return err
+        items = node.get("items")
+        if isinstance(items, Mapping):
+            err = _walk(items, depth + 1, active_refs)
+            if err:
+                return err
+        elif isinstance(items, list):
+            for child in items:
+                err = _walk(child, depth + 1, active_refs)
+                if err:
+                    return err
+        for comb in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(comb)
+            if isinstance(branches, list):
+                for child in branches:
+                    err = _walk(child, depth + 1, active_refs)
+                    if err:
+                        return err
+        additional = node.get("additionalProperties")
+        if isinstance(additional, Mapping):
+            err = _walk(additional, depth + 1, active_refs)
+            if err:
+                return err
+        return None
+
+    error = _walk(input_schema, 0, frozenset())
+    if error is not None:
+        return False, error
+    return True, None
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedMcpDraft:
+    """Validated untrusted draft parsed from an external `mcpServers` JSON document."""
+
+    name: str
+    transport: TransportKind
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    cwd: str | None = None
+    url: str | None = None
+    allow_private_network: bool = False
+    plain_env: Mapping[str, str] = ()  # type: ignore[assignment]
+    secret_env: Mapping[str, str] = ()  # type: ignore[assignment]
+    plain_headers: Mapping[str, str] = ()  # type: ignore[assignment]
+    secret_headers: Mapping[str, str] = ()  # type: ignore[assignment]
+    warnings: tuple[str, ...] = ()
+
+
+_ALLOWED_STDIO_JSON_KEYS = frozenset({"command", "args", "cwd", "env", "transport", "type"})
+_ALLOWED_HTTP_JSON_KEYS = frozenset({"url", "headers", "transport", "type", "allowPrivateNetwork", "allow_private_network"})
+
+
+def parse_mcp_servers_json(raw_json: str) -> list[ParsedMcpDraft]:
+    """Strictly parse a `{"mcpServers": {...}}` JSON config into untrusted draft entries.
+
+    Never executes external commands, never persists data, and automatically separates
+    suspected secrets from plaintext fields while flagging suspicious args/query strings.
+    """
+    if not isinstance(raw_json, str) or not raw_json.strip():
+        raise McpError("MCP_INVALID_CONFIG", "导入的 JSON 内容不能为空。")
+    if len(raw_json.encode("utf-8")) > MAX_IMPORT_JSON_BYTES:
+        raise McpError("MCP_INVALID_CONFIG", "导入的 JSON 体积超过安全上限（256 KiB）。")
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise McpError("MCP_INVALID_CONFIG", f"JSON 语法无效（第 {exc.lineno} 行）。") from None
+
+    if not isinstance(parsed, dict):
+        raise McpError("MCP_INVALID_CONFIG", "导入配置顶层必须为 JSON 对象。")
+    extra_top = set(parsed.keys()) - {"mcpServers"}
+    if extra_top:
+        raise McpError("MCP_INVALID_CONFIG", f"导入 JSON 包含不支持的顶层字段: {', '.join(sorted(extra_top))}")
+    servers = parsed.get("mcpServers")
+    if not isinstance(servers, dict) or not servers:
+        raise McpError("MCP_INVALID_CONFIG", "导入 JSON 必须包含非空的 mcpServers 对象。")
+    if len(servers) > 16:
+        raise McpError("MCP_INVALID_CONFIG", "单次导入最多支持 16 个 MCP 服务。")
+
+    drafts: list[ParsedMcpDraft] = []
+    seen_names: set[str] = set()
+    for raw_name, entry in servers.items():
+        if not isinstance(raw_name, str) or not 1 <= len(raw_name.strip()) <= MAX_NAME_LENGTH:
+            raise McpError("MCP_INVALID_CONFIG", "服务名称无效或超出 100 字符上限。")
+        name = raw_name.strip()
+        if _has_control_chars(name):
+            raise McpError("MCP_INVALID_CONFIG", "服务名称不能包含控制字符。")
+        lowered = name.lower()
+        if lowered in seen_names:
+            raise McpError("MCP_INVALID_CONFIG", f"导入 JSON 中存在重复的服务名称: {name}")
+        seen_names.add(lowered)
+
+        if not isinstance(entry, dict):
+            raise McpError("MCP_INVALID_CONFIG", f"服务 {name} 的配置必须为 JSON 对象。")
+
+        explicit_transport = entry.get("transport") or entry.get("type")
+        if explicit_transport is not None:
+            if not isinstance(explicit_transport, str):
+                raise McpError("MCP_INVALID_CONFIG", f"服务 {name} 的 transport 字段必须为字符串。")
+            t_lower = explicit_transport.strip().lower()
+            if t_lower == "sse":
+                raise McpError("MCP_INVALID_CONFIG", f"服务 {name} 使用旧版 SSE 传输，当前仅支持 stdio 与 streamable_http。")
+            if t_lower in ("http", "streamable-http", "streamable_http"):
+                transport: TransportKind = "streamable_http"
+            elif t_lower == "stdio":
+                transport = "stdio"
+            else:
+                raise McpError("MCP_INVALID_CONFIG", f"服务 {name} 指定了不支持的传输类型: {explicit_transport}")
+        elif "command" in entry and "url" not in entry:
+            transport = "stdio"
+        elif "url" in entry and "command" not in entry:
+            transport = "streamable_http"
+        else:
+            raise McpError("MCP_INVALID_CONFIG", f"服务 {name} 必须明确且互斥地提供 command（stdio）或 url（streamable_http）。")
+
+        warnings: list[str] = []
+        if transport == "stdio":
+            unknown = set(entry.keys()) - _ALLOWED_STDIO_JSON_KEYS
+            if unknown:
+                raise McpError("MCP_INVALID_CONFIG", f"stdio 服务 {name} 包含不支持的字段: {', '.join(sorted(unknown))}")
+            command = entry.get("command")
+            if not isinstance(command, str) or not command.strip():
+                raise McpError("MCP_INVALID_CONFIG", f"stdio 服务 {name} 缺少有效的 command。")
+            raw_args = entry.get("args", [])
+            if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
+                raise McpError("MCP_INVALID_CONFIG", f"stdio 服务 {name} 的 args 必须为字符串数组。")
+            args_tuple = tuple(raw_args)
+            cwd = entry.get("cwd")
+            if cwd is not None and not isinstance(cwd, str):
+                raise McpError("MCP_INVALID_CONFIG", f"stdio 服务 {name} 的 cwd 必须为字符串。")
+            raw_env = entry.get("env", {})
+            if not isinstance(raw_env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw_env.items()):
+                raise McpError("MCP_INVALID_CONFIG", f"stdio 服务 {name} 的 env 必须为字符串键值对。")
+
+            plain_env: dict[str, str] = {}
+            secret_env: dict[str, str] = {}
+            for key, val in raw_env.items():
+                if is_suspected_secret_key(key) or looks_like_secret_value(val):
+                    validate_secret_value(key, val)
+                    secret_env[key] = val
+                else:
+                    plain_env[key] = val
+
+            # Validate full structural & bypass rules (e.g. inline secrets in args)
+            check_secret_bypass(transport="stdio", args=args_tuple, plain_env=plain_env)
+            validate_server_config(
+                McpServerConfig(
+                    server_id="draft-check",
+                    name=name,
+                    transport="stdio",
+                    command=command.strip(),
+                    args=args_tuple,
+                    cwd=cwd,
+                    env=plain_env,
+                    secret_env=secret_env,
+                    enabled=False,
+                )
+            )
+            high_risk, risk_reasons = inspect_high_risk_command(command.strip(), args_tuple)
+            if high_risk:
+                warnings.extend(risk_reasons)
+            if secret_env:
+                warnings.append(f"已自动将 {len(secret_env)} 个敏感环境变量划入钥匙串凭据，需人工审核确认。")
+            drafts.append(
+                ParsedMcpDraft(
+                    name=name,
+                    transport="stdio",
+                    command=command.strip(),
+                    args=args_tuple,
+                    cwd=cwd,
+                    plain_env=plain_env,
+                    secret_env=secret_env,
+                    plain_headers={},
+                    secret_headers={},
+                    warnings=tuple(warnings),
+                )
+            )
+        else:
+            unknown = set(entry.keys()) - _ALLOWED_HTTP_JSON_KEYS
+            if unknown:
+                raise McpError("MCP_INVALID_CONFIG", f"HTTP 服务 {name} 包含不支持的字段: {', '.join(sorted(unknown))}")
+            url = entry.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise McpError("MCP_INVALID_CONFIG", f"HTTP 服务 {name} 缺少有效的 url。")
+            url_clean = url.strip()
+            allow_private = bool(entry.get("allowPrivateNetwork", entry.get("allow_private_network", False)))
+            raw_headers = entry.get("headers", {})
+            if not isinstance(raw_headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in raw_headers.items()):
+                raise McpError("MCP_INVALID_CONFIG", f"HTTP 服务 {name} 的 headers 必须为字符串键值对。")
+
+            plain_headers: dict[str, str] = {}
+            secret_headers: dict[str, str] = {}
+            for key, val in raw_headers.items():
+                if key.strip().lower() in STRICT_SECRET_HEADERS or is_suspected_secret_key(key) or looks_like_secret_value(val):
+                    validate_secret_value(key, val)
+                    secret_headers[key] = val
+                else:
+                    plain_headers[key] = val
+
+            check_secret_bypass(transport="streamable_http", url=url_clean, plain_headers=plain_headers)
+            validate_server_config(
+                McpServerConfig(
+                    server_id="draft-check",
+                    name=name,
+                    transport="streamable_http",
+                    url=url_clean,
+                    headers=plain_headers,
+                    secret_headers=secret_headers,
+                    allow_private_network=allow_private,
+                    enabled=False,
+                )
+            )
+            if is_private_network_url(url_clean):
+                warnings.append("目标地址指向私有内网网段，信任前请确认来源可信。")
+            if secret_headers:
+                warnings.append(f"已自动将 {len(secret_headers)} 个认证 Header 划入钥匙串凭据，需人工审核确认。")
+            drafts.append(
+                ParsedMcpDraft(
+                    name=name,
+                    transport="streamable_http",
+                    url=url_clean,
+                    allow_private_network=allow_private,
+                    plain_env={},
+                    secret_env={},
+                    plain_headers=plain_headers,
+                    secret_headers=secret_headers,
+                    warnings=tuple(warnings),
+                )
+            )
+
+    return drafts

@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from collections.abc import Callable, Sequence
 from contextlib import aclosing
@@ -35,6 +36,7 @@ async def answer_with_agent(
     message: str,
     *,
     on_delta: Callable[[str], None] | None = None,
+    on_reset_draft: Callable[[], None] | None = None,
     checkpointer: AsyncSqliteSaver | None = None,
     config: RunnableConfig | None = None,
     tools: RunTools | None = None,
@@ -46,12 +48,19 @@ async def answer_with_agent(
     inputs = {"messages": [HumanMessage(content=message)]}
     with tracing_context(enabled=False):
         if checkpointer is not None:
-            graph = (build_tool_graph(model, tools, checkpointer, on_delta, system_prompt=system_prompt) if tools is not None
+            graph = (build_tool_graph(model, tools, checkpointer, on_delta, system_prompt=system_prompt,
+                                      on_reset_draft=on_reset_draft) if tools is not None
                      else create_agent(model=model, tools=[], system_prompt=system_prompt, checkpointer=checkpointer))
             try:
                 return await _checkpointed_answer(graph, inputs, config, on_delta, tools)
+            except (asyncio.CancelledError, TimeoutError, ModelError):
+                raise
             except sqlite3.Error:
                 raise ModelError("INTERNAL_ERROR", "无法保存或读取对话检查点。") from None
+            except Exception:
+                if tools is None:
+                    raise ModelError("MODEL_UPSTREAM_ERROR", "DeepSeek 调用失败或响应无效。") from None
+                raise
 
         graph = create_agent(model=model, tools=[], system_prompt=system_prompt, checkpointer=checkpointer)
         if on_delta is None:

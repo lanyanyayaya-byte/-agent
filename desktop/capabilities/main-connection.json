@@ -10,6 +10,16 @@
     "allow-open-log-directory",
     "allow-select-file-grant",
     "allow-revoke-file-grant",
-    "allow-select-and-import-document"
+    "allow-select-and-import-document",
+    "allow-mcp-save-server",
+    "allow-mcp-import-servers-json",
+    "allow-mcp-trust-server",
+    "allow-mcp-revoke-trust",
+    "allow-mcp-delete-server",
+    "allow-mcp-connect-server",
+    "allow-mcp-disconnect-server",
+    "allow-mcp-refresh-tools",
+    "allow-mcp-set-server-enabled",
+    "allow-mcp-set-tool-permission"
   ]
 }

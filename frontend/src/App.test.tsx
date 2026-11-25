@@ -14,9 +14,20 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
+  localStorage.clear();
   vi.resetAllMocks();
   vi.unstubAllGlobals();
 });
+
+const emptyMcpSummary = {
+  total_servers: 0,
+  enabled_servers: 0,
+  connected_servers: 0,
+  error_servers: 0,
+  effective_allowed_tools: 0,
+  max_tools_per_run: 32,
+  exceeds_tool_limit: false,
+};
 
 test('keeps the active session and SSE draft while the library is open', async () => {
   vi.mocked(invoke).mockResolvedValue({ base_url: 'http://127.0.0.1:8766', ui_token: 'ui-test' });
@@ -34,6 +45,8 @@ test('keeps the active session and SSE draft while the library is open', async (
       session_id: sessionId, title: '测试会话', updated_at: ts, active_run_id: null, active_run_status: null,
     }]);
     if (path === `/sessions/${sessionId}/runs`) return Response.json({ items: [], next_cursor: null });
+    if (path === '/mcp/summary') return Response.json(emptyMcpSummary);
+    if (path === '/mcp/servers') return Response.json([]);
     if ([`/sessions/${sessionId}/messages`, `/sessions/${sessionId}/grants`, '/knowledge/documents'].includes(path)) {
       return Response.json([]);
     }
@@ -68,6 +81,12 @@ test('keeps the active session and SSE draft while the library is open', async (
   await screen.findByText('第一段草稿，第二段草稿');
   expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '当前会话' }).value).toBe(sessionId);
   expect(screen.getByRole('heading', { name: '文件授权' })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'MCP 服务' }));
+  await screen.findByText('尚未配置任何 MCP 服务');
+  expect(streamSignal?.aborted).toBe(false);
+  fireEvent.click(screen.getByRole('button', { name: '聊天' }));
+  expect(screen.getByText('第一段草稿，第二段草稿')).toBeTruthy();
   expect(streamSignal?.aborted).toBe(false);
   streamController.close();
 });
@@ -95,8 +114,11 @@ test('requests the host connection, authenticates the status call and retries af
   const fetchStatus = vi.fn()
     .mockReturnValueOnce(firstRequest.promise)
     .mockResolvedValueOnce(Response.json({ status: 'ready', database: 'not_configured', model_configured: false }));
-  vi.stubGlobal('fetch', (url: string, options: RequestInit) =>
-    url.endsWith('/sessions') ? Promise.resolve(Response.json([])) : fetchStatus(url, options));
+  vi.stubGlobal('fetch', (url: string, options: RequestInit) => {
+    if (url.endsWith('/sessions')) return Promise.resolve(Response.json([]));
+    if (url.endsWith('/mcp/summary')) return Promise.resolve(Response.json(emptyMcpSummary));
+    return fetchStatus(url, options);
+  });
 
   render(<App />);
   expect(screen.getByText('starting_sidecar')).toBeTruthy();
@@ -137,8 +159,11 @@ test('submits the password only to the credential IPC and clears it immediately'
   const fetchStatus = vi.fn().mockResolvedValue(Response.json({
     status: 'ready', database: 'not_configured', model_configured: false,
   }));
-  vi.stubGlobal('fetch', (url: string, options: RequestInit) =>
-    url.endsWith('/sessions') ? Promise.resolve(Response.json([])) : fetchStatus(url, options));
+  vi.stubGlobal('fetch', (url: string, options: RequestInit) => {
+    if (url.endsWith('/sessions')) return Promise.resolve(Response.json([]));
+    if (url.endsWith('/mcp/summary')) return Promise.resolve(Response.json(emptyMcpSummary));
+    return fetchStatus(url, options);
+  });
 
   render(<App />);
   const field = await screen.findByLabelText('DeepSeek API Key') as HTMLInputElement;

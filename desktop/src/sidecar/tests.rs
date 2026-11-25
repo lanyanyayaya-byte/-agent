@@ -821,3 +821,494 @@ raise SystemExit(main())
     assert!(sidecar.request_shutdown());
     sidecar.wait_stopped().await;
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn sidecar_sigkill_reaps_stubborn_stdio_mcp_process_group_and_normal_exit_cleans_up() {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    let data = tempdir().unwrap();
+    let keychain = TestKeychainGuard::new();
+    let mcp_service = format!("local.knowledgeagent.desktop.test.{}.mcp-sigkill", random_token().unwrap());
+    let mcp_creds = McpCredentialStore::with_backend(mcp_service, Arc::new(NoopMcpCredentialBackend));
+
+    let backend_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../backend");
+    let python_exe = backend_dir
+        .join(".venv/bin/python")
+        .canonicalize()
+        .expect("backend venv python");
+    let stubborn_script = backend_dir
+        .join("tests/fixtures/mcp/stdio_test_server.py")
+        .canonicalize()
+        .expect("stdio_test_server.py");
+
+    let sidecar = Sidecar::start_with_mcp(
+        development_command(),
+        data.path().to_owned(),
+        keychain.store.clone(),
+        mcp_creds.clone(),
+        |_, _| async { Ok(None) },
+    );
+    let host = sidecar.mcp_host_connection().await.unwrap();
+    let instance_id = host.host_instance_id();
+
+    // Find Sidecar OS PID from host.jsonl
+    let host_log_path = data.path().join("logs/host.jsonl");
+    let sidecar_pid: u32 = std::fs::read_to_string(&host_log_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|ev| {
+            ev.get("event").and_then(|v| v.as_str()) == Some("sidecar_connected")
+                && ev.get("instance_id").and_then(|v| v.as_str()) == Some(&instance_id.to_string())
+        })
+        .and_then(|ev| ev.get("child_pid").and_then(|v| v.as_u64()))
+        .expect("sidecar child_pid in host.jsonl") as u32;
+
+    // Create, trust, and connect a stubborn stdio MCP server (ignores EOF & SIGTERM!)
+    let created = host
+        .create_mcp_server(&json!({
+            "name": "StubbornStdio",
+            "transport": "stdio",
+            "command": python_exe.to_string_lossy(),
+            "args": [stubborn_script.to_string_lossy(), "--ignore-eof-and-sigterm"],
+            "env_config": BTreeMap::<String, serde_json::Value>::new(),
+            "header_config": BTreeMap::<String, serde_json::Value>::new(),
+        }))
+        .await
+        .unwrap();
+    let server_id = created["server_id"].as_str().unwrap().to_owned();
+    let rev = created["config_revision"].as_u64().unwrap();
+    let fp = created["current_fingerprint"].as_str().unwrap().to_owned();
+    host.trust_mcp_server(&server_id, rev, &fp, true)
+        .await
+        .unwrap();
+    let connected = host.connect_mcp_server(&server_id).await.unwrap();
+    assert_eq!(connected["runtime"]["state"].as_str(), Some("connected"));
+
+    // Read the registered managed MCP child PID from the instance process registry
+    let proc_dir = data
+        .path()
+        .join("runtime/mcp-procs")
+        .join(instance_id.to_string());
+    let mut mcp_child_pid: Option<u32> = None;
+    for entry in std::fs::read_dir(&proc_dir).unwrap().flatten() {
+        let raw = std::fs::read(entry.path()).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        if val.get("kind").and_then(|v| v.as_str()) == Some("active") {
+            mcp_child_pid = val.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+            break;
+        }
+    }
+    let mcp_pid = mcp_child_pid.expect("active MCP process record must exist");
+    assert_eq!(
+        unsafe { libc::kill(mcp_pid as libc::pid_t, 0) },
+        0,
+        "stubborn MCP child must be alive before Sidecar SIGKILL"
+    );
+
+    // Send SIGKILL directly to the Sidecar Python process!
+    assert_eq!(unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) }, 0);
+
+    // Wait for Rust host supervisor to detect Sidecar death, reap the stubborn MCP child group,
+    // log mcp_orphan_reaped, and remove the instance registry directory.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let rc = unsafe { libc::kill(mcp_pid as libc::pid_t, 0) };
+        let child_gone = rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if child_gone && !proc_dir.exists() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stubborn stdio MCP child (pid {mcp_pid}) or registry dir survived Sidecar SIGKILL!"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Verify host.jsonl recorded mcp_orphan_reaped and registry dir was cleaned
+    let log_text = std::fs::read_to_string(&host_log_path).unwrap();
+    assert!(
+        log_text.contains("\"event\":\"mcp_orphan_reaped\""),
+        "expected mcp_orphan_reaped event in host.jsonl"
+    );
+    assert!(!proc_dir.exists());
+
+    // Now test normal restart + clean shutdown leaves 0 processes and 0 registry files
+    let host2 = sidecar.mcp_host_connection().await.unwrap();
+    let inst2 = host2.host_instance_id();
+    assert_ne!(inst2, instance_id);
+    // Auto-connect (via background mcp restore-complete) or explicit connect works on restarted Sidecar
+    let conn2 = host2.connect_mcp_server(&server_id).await.unwrap();
+    assert_eq!(conn2["runtime"]["state"].as_str(), Some("connected"));
+    let proc_dir_2 = data
+        .path()
+        .join("runtime/mcp-procs")
+        .join(inst2.to_string());
+    let mut mcp_pid_2 = None;
+    for entry in std::fs::read_dir(&proc_dir_2).unwrap().flatten() {
+        let val: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+        if val.get("kind").and_then(|v| v.as_str()) == Some("active") {
+            mcp_pid_2 = val.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+        }
+    }
+    let mcp_pid_2 = mcp_pid_2.expect("restarted MCP child pid");
+
+    assert!(sidecar.request_shutdown());
+    sidecar.wait_stopped().await;
+
+    assert_ne!(
+        unsafe { libc::kill(mcp_pid_2 as libc::pid_t, 0) },
+        0,
+        "MCP child must exit cleanly on normal shutdown"
+    );
+    assert!(!proc_dir_2.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn mcp_keychain_sqlite_memory_partial_failure_compensation_and_startup_recovery() {
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    use crate::mcp::{
+        connect_server_with_store, delete_server_with_store, save_server_with_store,
+        ConfigEntryRequest, SaveMcpServerRequest, MCP_KEYCHAIN_CLEANUP_FAILED,
+    };
+
+    #[derive(Default)]
+    struct FaultyKeychainBackend {
+        items: StdMutex<HashMap<(String, String), Zeroizing<String>>>,
+        fail_save: StdMutex<bool>,
+        fail_delete: StdMutex<bool>,
+    }
+
+    impl CredentialBackend for FaultyKeychainBackend {
+        fn load(
+            &self,
+            service: &str,
+            account: &str,
+        ) -> Result<Option<Zeroizing<String>>, KeychainError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .get(&(service.to_owned(), account.to_owned()))
+                .cloned())
+        }
+        fn save(&self, service: &str, account: &str, secret: &str) -> Result<(), KeychainError> {
+            if *self.fail_save.lock().unwrap() {
+                return Err(KeychainError::Unavailable(-25291));
+            }
+            self.items.lock().unwrap().insert(
+                (service.to_owned(), account.to_owned()),
+                Zeroizing::new(secret.to_owned()),
+            );
+            Ok(())
+        }
+        fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError> {
+            if *self.fail_delete.lock().unwrap() {
+                return Err(KeychainError::AccessDenied(-25293));
+            }
+            self.items
+                .lock()
+                .unwrap()
+                .remove(&(service.to_owned(), account.to_owned()));
+            Ok(())
+        }
+    }
+
+    let data = tempdir().unwrap();
+    let keychain = TestKeychainGuard::new();
+    let faulty = Arc::new(FaultyKeychainBackend::default());
+    let mcp_creds = McpCredentialStore::with_backend(
+        "local.knowledgeagent.desktop.test.mcp-credentials",
+        faulty.clone(),
+    );
+
+    let backend_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../backend");
+    let python_exe = backend_dir
+        .join(".venv/bin/python")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let stdio_script = backend_dir
+        .join("tests/fixtures/mcp/stdio_test_server.py")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let sidecar = Sidecar::start_with_mcp(
+        development_command(),
+        data.path().to_owned(),
+        keychain.store.clone(),
+        mcp_creds.clone(),
+        |_, _| async { Ok(None) },
+    );
+    let host = sidecar.mcp_host_connection().await.unwrap();
+
+    // Create Server A with secret in Keychain
+    let secret_a_v1 = "mcp-secret-a-v1-never-leak-111";
+    let mut env_a = BTreeMap::new();
+    env_a.insert(
+        "SERVER_TOKEN".to_owned(),
+        ConfigEntryRequest::Secret {
+            secret_key: "SERVER_TOKEN".to_owned(),
+        },
+    );
+    let mut secrets_a = BTreeMap::new();
+    secrets_a.insert("SERVER_TOKEN".to_owned(), secret_a_v1.to_owned());
+
+    let srv_a = save_server_with_store(
+        &host,
+        &mcp_creds,
+        SaveMcpServerRequest {
+            server_id: None,
+            name: "ServerAlpha".to_owned(),
+            transport: "stdio".to_owned(),
+            command: Some(python_exe.clone()),
+            args: vec![stdio_script.clone()],
+            cwd: None,
+            clear_cwd: false,
+            url: None,
+            allow_private_network: false,
+            env_config: env_a.clone(),
+            header_config: BTreeMap::new(),
+            secret_values: secrets_a,
+            remove_secret_keys: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let id_a = srv_a["server_id"].as_str().unwrap().to_owned();
+    assert_eq!(srv_a["credentials_complete"].as_bool(), Some(true));
+
+    // Create Server B with its own secret
+    let secret_b = "mcp-secret-b-v1-never-leak-222";
+    let mut secrets_b = BTreeMap::new();
+    secrets_b.insert("SERVER_TOKEN".to_owned(), secret_b.to_owned());
+    let srv_b = save_server_with_store(
+        &host,
+        &mcp_creds,
+        SaveMcpServerRequest {
+            server_id: None,
+            name: "ServerBeta".to_owned(),
+            transport: "stdio".to_owned(),
+            command: Some(python_exe.clone()),
+            args: vec![stdio_script.clone()],
+            cwd: None,
+            clear_cwd: false,
+            url: None,
+            allow_private_network: false,
+            env_config: env_a.clone(),
+            header_config: BTreeMap::new(),
+            secret_values: secrets_b,
+            remove_secret_keys: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let id_b = srv_b["server_id"].as_str().unwrap().to_owned();
+
+    // Scenario 1: Keychain write succeeds on update, but DB save fails (name conflict with ServerBeta)
+    // -> Keychain MUST roll back to secret_a_v1!
+    let mut secrets_a_v2 = BTreeMap::new();
+    secrets_a_v2.insert("SERVER_TOKEN".to_owned(), "mcp-secret-a-v2-rolled-back".to_owned());
+    let err = save_server_with_store(
+        &host,
+        &mcp_creds,
+        SaveMcpServerRequest {
+            server_id: Some(id_a.clone()),
+            name: "ServerBeta".to_owned(), // collides with ServerBeta!
+            transport: "stdio".to_owned(),
+            command: Some(python_exe.clone()),
+            args: vec![stdio_script.clone()],
+            cwd: None,
+            clear_cwd: false,
+            url: None,
+            allow_private_network: false,
+            env_config: env_a.clone(),
+            header_config: BTreeMap::new(),
+            secret_values: secrets_a_v2,
+            remove_secret_keys: Vec::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "MCP_SERVER_NAME_CONFLICT");
+    let stored_a = mcp_creds.load(&id_a).unwrap().unwrap();
+    assert_eq!(stored_a.get("SERVER_TOKEN").map(|z| z.as_str()), Some(secret_a_v1));
+
+    // Scenario 2: DB create succeeds, but Keychain write fails -> newly created DB row MUST roll back!
+    *faulty.fail_save.lock().unwrap() = true;
+    let mut secrets_c = BTreeMap::new();
+    secrets_c.insert("SERVER_TOKEN".to_owned(), "mcp-secret-c-never-saved".to_owned());
+    let create_err = save_server_with_store(
+        &host,
+        &mcp_creds,
+        SaveMcpServerRequest {
+            server_id: None,
+            name: "ServerGamma".to_owned(),
+            transport: "stdio".to_owned(),
+            command: Some(python_exe.clone()),
+            args: vec![stdio_script.clone()],
+            cwd: None,
+            clear_cwd: false,
+            url: None,
+            allow_private_network: false,
+            env_config: env_a.clone(),
+            header_config: BTreeMap::new(),
+            secret_values: secrets_c,
+            remove_secret_keys: Vec::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(create_err, KEYCHAIN_ACCESS_FAILED);
+    *faulty.fail_save.lock().unwrap() = false;
+    // ServerGamma must NOT remain in SQLite (refs only contain ServerAlpha & ServerBeta)
+    let refs = host.list_mcp_credential_refs().await.unwrap();
+    assert_eq!(refs.len(), 2);
+
+    // Scenario 3: Trust both ServerAlpha and ServerBeta; clear ServerAlpha memory credentials
+    // (simulating failed replay) -> connect_server_with_store self-heals by replaying from Keychain!
+    host.trust_mcp_server(
+        &id_a,
+        srv_a["config_revision"].as_u64().unwrap(),
+        srv_a["current_fingerprint"].as_str().unwrap(),
+        true,
+    )
+    .await
+    .unwrap();
+    host.trust_mcp_server(
+        &id_b,
+        srv_b["config_revision"].as_u64().unwrap(),
+        srv_b["current_fingerprint"].as_str().unwrap(),
+        true,
+    )
+    .await
+    .unwrap();
+    host.delete_mcp_credentials(&id_a).await.unwrap();
+    assert_eq!(
+        host.get_mcp_server(&id_a).await.unwrap()["credentials_complete"].as_bool(),
+        Some(false)
+    );
+    let healed = connect_server_with_store(&host, &mcp_creds, &id_a)
+        .await
+        .unwrap();
+    assert_eq!(healed["runtime"]["state"].as_str(), Some("connected"));
+    assert_eq!(healed["credentials_complete"].as_bool(), Some(true));
+
+    // Scenario 4: Server delete succeeds in SQLite, but Keychain delete fails -> returns MCP_KEYCHAIN_CLEANUP_FAILED
+    // while DB row is deleted and logs contain zero plaintext secrets.
+    let mut secrets_del = BTreeMap::new();
+    secrets_del.insert("SERVER_TOKEN".to_owned(), "mcp-secret-del-never-leak-333".to_owned());
+    let srv_del = save_server_with_store(
+        &host,
+        &mcp_creds,
+        SaveMcpServerRequest {
+            server_id: None,
+            name: "ServerDeleteMe".to_owned(),
+            transport: "stdio".to_owned(),
+            command: Some(python_exe.clone()),
+            args: vec![stdio_script.clone()],
+            cwd: None,
+            clear_cwd: false,
+            url: None,
+            allow_private_network: false,
+            env_config: env_a.clone(),
+            header_config: BTreeMap::new(),
+            secret_values: secrets_del,
+            remove_secret_keys: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let id_del = srv_del["server_id"].as_str().unwrap().to_owned();
+    *faulty.fail_delete.lock().unwrap() = true;
+    let del_err = delete_server_with_store(&host, &mcp_creds, &id_del)
+        .await
+        .unwrap_err();
+    assert_eq!(del_err, MCP_KEYCHAIN_CLEANUP_FAILED);
+    *faulty.fail_delete.lock().unwrap() = false;
+    // DB row is gone
+    assert!(host.get_mcp_server(&id_del).await.is_err());
+
+    // Scenario 5: Restart Sidecar with partial Keychain credentials missing (delete ServerBeta's Keychain entry).
+    // Background restore must recover ServerAlpha -> connected, while ServerBeta stays disconnected with credentials_complete=false!
+    mcp_creds.delete(&id_b).unwrap();
+    assert!(sidecar.request_shutdown());
+    sidecar.wait_stopped().await;
+
+    let sidecar2 = Sidecar::start_with_mcp(
+        development_command(),
+        data.path().to_owned(),
+        keychain.store.clone(),
+        mcp_creds.clone(),
+        |_, _| async { Ok(None) },
+    );
+    let host2 = sidecar2.mcp_host_connection().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let a_view = host2.get_mcp_server(&id_a).await.unwrap();
+        if a_view["runtime"]["state"].as_str() == Some("connected") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "ServerAlpha did not auto-recover after restart: {a_view}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let b_view = host2.get_mcp_server(&id_b).await.unwrap();
+    assert_eq!(b_view["credentials_complete"].as_bool(), Some(false));
+    assert_eq!(b_view["runtime"]["state"].as_str(), Some("disconnected"));
+
+    // Scenario 6: Host IPC revoke-trust validates server_id, disconnects active server,
+    // resets trust_state to untrusted, and blocks reconnect until re-trusted.
+    let bad_revoke = crate::mcp::revoke_trust_with_host(&host2, "../evil-id")
+        .await
+        .unwrap_err();
+    assert_eq!(bad_revoke, crate::mcp::MCP_INVALID_REQUEST);
+
+    let revoked = crate::mcp::revoke_trust_with_host(&host2, &id_a)
+        .await
+        .unwrap();
+    assert_eq!(revoked["trust_state"].as_str(), Some("untrusted"));
+    assert_eq!(revoked["trust_valid"].as_bool(), Some(false));
+    assert_eq!(revoked["enabled"].as_bool(), Some(false));
+    assert_eq!(revoked["runtime"]["state"].as_str(), Some("disconnected"));
+
+    let reconnect_err = host2.connect_mcp_server(&id_a).await.unwrap_err();
+    assert_eq!(reconnect_err, "MCP_SERVER_UNAVAILABLE");
+    let reenable_err = host2
+        .update_mcp_server(&id_a, &json!({ "enabled": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(reenable_err, "MCP_UNTRUSTED_SERVER");
+
+    assert!(sidecar2.request_shutdown());
+    sidecar2.wait_stopped().await;
+
+    // Verify ZERO plaintext secrets leaked into host.jsonl or sidecar.jsonl!
+    for log_file in ["logs/host.jsonl", "logs/sidecar.jsonl"] {
+        let path = data.path().join(log_file);
+        if path.exists() {
+            let content = std::fs::read_to_string(path).unwrap();
+            for secret in [
+                secret_a_v1,
+                secret_b,
+                "mcp-secret-a-v2-rolled-back",
+                "mcp-secret-c-never-saved",
+                "mcp-secret-del-never-leak-333",
+            ] {
+                assert!(!content.contains(secret), "secret leaked into {log_file}");
+            }
+        }
+    }
+}

@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "exa": {
+      "type": "streamable-http",
+      "url": "https://mcp.exa.ai/mcp",
+      "allow_private_network": true
+    },
+    "mcp-fetch": {
+      "command": "<YOUR_HOME>/.local/bin/mcp-server-fetch",
+      "args": ["--allow-private-ips"]
+    },
+    "arxiv": {
+      "command": "<YOUR_HOME>/.local/bin/arxiv-mcp-server",
+      "args": []
+    },
+    "context7": {
+      "type": "streamable-http",
+      "url": "https://mcp.context7.com/mcp",
+      "allow_private_network": true
+    },
+    "deepwiki": {
+      "type": "streamable-http",
+      "url": "https://mcp.deepwiki.com/mcp",
+      "allow_private_network": true
+    }
+  }
+}

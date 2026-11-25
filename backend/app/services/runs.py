@@ -3,8 +3,8 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
-from typing import Any, Literal
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Literal
+from uuid import UUID, uuid4
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -19,8 +19,13 @@ from app.storage.business import (
     INTERRUPTED_CODE, TERMINAL_STATUSES, BusinessStore, Run, RunStatus, Session, StoredCitation, utc_now,
 )
 from app.storage.checkpoints import open_checkpointer
-from app.tools.protocol import ToolEvent
-from app.tools.registry import RunTools
+from app.tools.protocol import ERROR_MESSAGES, ToolEvent
+from app.tools.registry import RunToolSnapshot, RunTools
+
+if TYPE_CHECKING:
+    from app.services.mcp import McpService
+
+DEFAULT_MAX_RUN_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +34,12 @@ class KnowledgeRunConfig:
     retrieval_mode: RetrievalMode = "hybrid"
     coverage_mode: CoverageMode = "global"
     top_k: int = 6
+
+
+@dataclass(frozen=True, slots=True)
+class McpRunConfig:
+    enabled: bool = False
+    allow_external_data_egress: bool = False
 
 
 class RunServiceStopping(Exception):
@@ -54,6 +65,7 @@ class RunStream:
     events: asyncio.Queue[RunEvent | None] = field(default_factory=asyncio.Queue)
     observed_text: list[str] = field(default_factory=list)
     citations: tuple[StoredCitation, ...] = ()
+    tool_snapshot: RunToolSnapshot | None = None
     _observing: bool = True
 
     def publish(self, event: RunEvent | None) -> None:
@@ -67,7 +79,12 @@ class RunStream:
         self.observed_text.append(delta)
         self.publish(RunEvent("message_delta", {"channel": "text", "delta": delta}))
 
-    def on_tool_event(self, event: ToolEvent, data: dict[str, str]) -> None:
+    def reset_observed_text(self) -> None:
+        self.observed_text.clear()
+
+    def on_tool_event(self, event: ToolEvent, data: dict[str, Any]) -> None:
+        if event == "tool_started" and self.observed_text:
+            self.observed_text.clear()
         self.publish(RunEvent(event, data))
 
 
@@ -80,11 +97,22 @@ class Execution:
 
 
 class RunService:
-    def __init__(self, store: BusinessStore, models: ModelService, grants: GrantRegistry):
+    def __init__(
+        self,
+        store: BusinessStore,
+        models: ModelService,
+        grants: GrantRegistry,
+        *,
+        max_run_seconds: float = DEFAULT_MAX_RUN_SECONDS,
+        mcp_tool_timeout_seconds: float | None = None,
+    ):
         self._store = store
         self._models = models
         self._grants = grants
         self.knowledge_qa: KnowledgeQAService | None = None
+        self.mcp_service: McpService | None = None
+        self._max_run_seconds = max_run_seconds
+        self._mcp_tool_timeout_seconds = mcp_tool_timeout_seconds
         self._checkpointer: AsyncSqliteSaver | None = None
         self._stopping = False
         self._workers: set[asyncio.Task] = set()
@@ -123,11 +151,12 @@ class RunService:
     async def start(
         self, session_id: str, client_request_id: str, message: str, *, request_id: str,
         knowledge: KnowledgeRunConfig | None = None,
+        mcp: McpRunConfig | None = None,
     ) -> RunStream:
         self._require_running()
         accepted = asyncio.get_running_loop().create_future()
         worker = asyncio.create_task(
-            self._run(session_id, client_request_id, message, accepted, request_id, knowledge),
+            self._run(session_id, client_request_id, message, accepted, request_id, knowledge, mcp),
         )
         self._workers.add(worker)
         worker.add_done_callback(self._workers.discard)
@@ -179,7 +208,25 @@ class RunService:
         await asyncio.gather(*self._workers, return_exceptions=True)
 
     async def _answer(
-        self, run: Run, message: str, stream: RunStream, knowledge: KnowledgeRunConfig | None = None,
+        self,
+        run: Run,
+        message: str,
+        stream: RunStream,
+        knowledge: KnowledgeRunConfig | None = None,
+    ) -> AgentAnswer:
+        try:
+            async with asyncio.timeout(self._max_run_seconds):
+                return await self._answer_inner(run, message, stream, knowledge, stream.tool_snapshot)
+        except TimeoutError:
+            raise ModelError("RUN_TIMEOUT", ERROR_MESSAGES["RUN_TIMEOUT"]) from None
+
+    async def _answer_inner(
+        self,
+        run: Run,
+        message: str,
+        stream: RunStream,
+        knowledge: KnowledgeRunConfig | None = None,
+        tool_snapshot: RunToolSnapshot | None = None,
     ) -> AgentAnswer:
         system_prompt: str | None = None
         if knowledge is not None:
@@ -245,14 +292,23 @@ class RunService:
             }))
             system_prompt = rag_ctx.system_prompt
 
-        tools = RunTools(self._grants, self._store, run, stream.on_tool_event)
-        if system_prompt is None and not tools.authorizations:
+        tools = RunTools(
+            self._grants,
+            self._store,
+            run,
+            stream.on_tool_event,
+            mcp_service=self.mcp_service,
+            snapshot=tool_snapshot,
+            mcp_tool_timeout_seconds=self._mcp_tool_timeout_seconds,
+        )
+        if system_prompt is None and not tools.has_tools:
             # Plain chat carries the configured assistant identity (production settings enable it).
             system_prompt = self._models.persona
         async with self._models.open_model() as model:
             return await answer_with_agent(
-                model, message, on_delta=stream.on_delta, checkpointer=self._checkpointer,
-                tools=tools if tools.authorizations else None,
+                model, message, on_delta=stream.on_delta, on_reset_draft=stream.reset_observed_text,
+                checkpointer=self._checkpointer,
+                tools=tools if tools.has_tools else None,
                 system_prompt=system_prompt,
                 config={
                     "configurable": {
@@ -266,19 +322,44 @@ class RunService:
 
     async def _run(
         self, session_id: str, client_request_id: str, message: str, accepted: asyncio.Future[RunStream],
-        request_id: str, knowledge: KnowledgeRunConfig | None = None,
+        request_id: str, knowledge: KnowledgeRunConfig | None = None, mcp: McpRunConfig | None = None,
     ) -> None:
         # The service owns admission and execution even if the requesting HTTP task disappears.
+        mcp_cfg = mcp or McpRunConfig(enabled=False, allow_external_data_egress=False)
         try:
             async with self._transitions:
                 self._require_running()
+                snapshot: RunToolSnapshot | None = None
+                precheck_error: ModelError | None = None
+                if self._models.configured:
+                    try:
+                        session_egress_risk = (
+                            await asyncio.to_thread(self._store.inspect_session_egress_risk, session_id)
+                            if mcp_cfg.enabled
+                            else None
+                        )
+                        snapshot = RunTools.build_snapshot(
+                            self._grants,
+                            UUID(session_id),
+                            mcp_service=self.mcp_service,
+                            mcp_enabled=mcp_cfg.enabled,
+                            allow_external_data_egress=mcp_cfg.allow_external_data_egress,
+                            knowledge_enabled=knowledge is not None,
+                            session_egress_risk=session_egress_risk,
+                        )
+                    except ModelError as err:
+                        precheck_error = err
+
                 run = await asyncio.to_thread(
                     self._store.start_run, session_id, client_request_id, message,
-                    accept_new_run=self._models.configured,
+                    accept_new_run=(self._models.configured and precheck_error is None),
                 )
                 if run is None:
-                    raise ModelError("MODEL_NOT_CONFIGURED", "请先设置 DeepSeek API Key。")
-                stream = RunStream(run)
+                    if not self._models.configured:
+                        raise ModelError("MODEL_NOT_CONFIGURED", "请先设置 DeepSeek API Key。")
+                    assert precheck_error is not None
+                    raise precheck_error
+                stream = RunStream(run, tool_snapshot=snapshot)
                 model = asyncio.create_task(
                     self._answer(run, message, stream) if knowledge is None
                     else self._answer(run, message, stream, knowledge)

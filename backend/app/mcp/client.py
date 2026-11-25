@@ -58,10 +58,11 @@ from app.mcp.policy import (
     validate_resolved_ip,
     validate_server_config,
 )
+from app.mcp.process_registry import McpProcessRegistry
 
 logger = logging.getLogger("knowledgeagent.mcp.client")
 
-CLIENT_INFO = types.Implementation(name="KnowledgeAgent", version="0.2.0")
+CLIENT_INFO = types.Implementation(name="KnowledgeAgent", version="0.3.0")
 
 # JSON-RPC / MCP error codes defined by mcp_types
 _PARSE_ERROR = getattr(types, "PARSE_ERROR", -32700)
@@ -398,6 +399,9 @@ async def _bounded_stdio_transport(
     config: McpServerConfig,
     limits: McpRuntimeLimits,
     state: _TransportState,
+    *,
+    generation: int = 0,
+    process_registry: McpProcessRegistry | None = None,
 ) -> AsyncIterator[
     tuple[
         MemoryObjectReceiveStream[SessionMessage | Exception],
@@ -416,6 +420,8 @@ async def _bounded_stdio_transport(
     )
     state.stderr = stderr_buf
 
+    if process_registry is not None:
+        process_registry.mark_launch_pending(config.server_id, generation, resolved_exe)
     try:
         process = await anyio.open_process(
             [str(resolved_exe), *config.args],
@@ -427,11 +433,18 @@ async def _bounded_stdio_transport(
             start_new_session=True,
         )
     except FileNotFoundError as exc:
+        if process_registry is not None:
+            process_registry.clear_launch_pending(config.server_id, generation)
         raise McpError("MCP_EXECUTABLE_NOT_FOUND", f"找不到可执行文件: {resolved_exe}") from exc
     except OSError as exc:
+        if process_registry is not None:
+            process_registry.clear_launch_pending(config.server_id, generation)
         raise McpError("MCP_CONNECT_FAILED", f"无法启动 stdio MCP 子进程: {type(exc).__name__}") from exc
 
     state.child_pid = process.pid
+    # Synchronously record kernel process identity before yielding to the event loop.
+    if process_registry is not None and process.pid is not None:
+        process_registry.register_process(config.server_id, generation, process.pid, resolved_exe)
     read_writer, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](0)
     write_stream, write_reader = anyio.create_memory_object_stream[SessionMessage](0)
     shutting_down = False
@@ -546,6 +559,8 @@ async def _bounded_stdio_transport(
                     eof_wait_seconds=limits.stdio_eof_wait_seconds,
                     sigterm_wait_seconds=limits.stdio_sigterm_wait_seconds,
                 )
+                if process_registry is not None:
+                    process_registry.unregister_process(config.server_id, generation, process.pid)
                 for res in (read_stream, write_stream, read_writer, write_reader):
                     with suppress(Exception):
                         await res.aclose()
@@ -842,6 +857,7 @@ async def open_mcp_connection(
     generation: int,
     on_tools_changed: Callable[[], None] | None = None,
     on_transport_closed: Callable[[McpError | None], None] | None = None,
+    process_registry: McpProcessRegistry | None = None,
 ) -> AsyncIterator[McpClientConnection]:
     """Open, initialize, and cleanly tear down a single MCP connection in the caller's task.
 
@@ -860,7 +876,13 @@ async def open_mcp_connection(
         async with AsyncExitStack() as stack:
             if config.transport == "stdio":
                 read_stream, write_stream = await stack.enter_async_context(
-                    _bounded_stdio_transport(config, limits, state)
+                    _bounded_stdio_transport(
+                        config,
+                        limits,
+                        state,
+                        generation=generation,
+                        process_registry=process_registry,
+                    )
                 )
             else:
                 read_stream, write_stream = await stack.enter_async_context(

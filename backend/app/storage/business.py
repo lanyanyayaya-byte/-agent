@@ -114,6 +114,72 @@ MIGRATIONS = (
         )""",
         "CREATE INDEX citations_by_session_run ON run_citations (session_id, run_id, ordinal)",
     ),
+    (
+        """CREATE TABLE mcp_servers (
+            server_id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            transport TEXT NOT NULL CHECK (transport IN ('stdio', 'streamable_http')),
+            command TEXT,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            cwd TEXT,
+            url TEXT,
+            allow_private_network INTEGER NOT NULL DEFAULT 0 CHECK (allow_private_network IN (0, 1)),
+            env_config_json TEXT NOT NULL DEFAULT '{}',
+            header_config_json TEXT NOT NULL DEFAULT '{}',
+            credential_ref TEXT,
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            trust_state TEXT NOT NULL DEFAULT 'untrusted' CHECK (trust_state IN ('untrusted', 'trusted')),
+            config_revision INTEGER NOT NULL DEFAULT 1 CHECK (config_revision >= 1),
+            trusted_revision INTEGER,
+            trusted_fingerprint TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (transport = 'stdio' AND command IS NOT NULL AND url IS NULL AND allow_private_network = 0)
+                OR
+                (transport = 'streamable_http' AND url IS NOT NULL AND command IS NULL AND cwd IS NULL)
+            ),
+            CHECK (
+                (trust_state = 'untrusted' AND trusted_revision IS NULL AND trusted_fingerprint IS NULL)
+                OR
+                (trust_state = 'trusted' AND trusted_revision IS NOT NULL AND trusted_fingerprint IS NOT NULL)
+            ),
+            CHECK (trusted_revision IS NULL OR trusted_revision <= config_revision)
+        )""",
+        "CREATE UNIQUE INDEX mcp_servers_name_unique ON mcp_servers (name COLLATE NOCASE)",
+        """CREATE TABLE mcp_tools (
+            tool_id TEXT PRIMARY KEY NOT NULL,
+            server_id TEXT NOT NULL REFERENCES mcp_servers(server_id) ON DELETE CASCADE,
+            original_tool_name TEXT NOT NULL,
+            title TEXT,
+            description TEXT NOT NULL DEFAULT '',
+            input_schema_json TEXT NOT NULL,
+            output_schema_json TEXT,
+            annotations_json TEXT NOT NULL DEFAULT '{}',
+            definition_hash TEXT NOT NULL,
+            schema_compatible INTEGER NOT NULL DEFAULT 1 CHECK (schema_compatible IN (0, 1)),
+            incompatibility_reason TEXT,
+            permission_state TEXT NOT NULL DEFAULT 'denied' CHECK (permission_state IN ('denied', 'allowed')),
+            approved_definition_hash TEXT,
+            approved_config_revision INTEGER,
+            present_in_last_discovery INTEGER NOT NULL DEFAULT 1 CHECK (present_in_last_discovery IN (0, 1)),
+            discovered_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (server_id, original_tool_name),
+            CHECK (
+                (permission_state = 'denied')
+                OR
+                (permission_state = 'allowed' AND approved_definition_hash IS NOT NULL AND approved_config_revision IS NOT NULL)
+            )
+        )""",
+        "CREATE INDEX mcp_tools_by_server ON mcp_tools (server_id, present_in_last_discovery, original_tool_name)",
+        "ALTER TABLE tool_calls ADD COLUMN source TEXT NOT NULL DEFAULT 'native' CHECK (source IN ('native', 'mcp'))",
+        "ALTER TABLE tool_calls ADD COLUMN server_id TEXT",
+        "ALTER TABLE tool_calls ADD COLUMN server_name_snapshot TEXT",
+        "ALTER TABLE tool_calls ADD COLUMN original_tool_name TEXT",
+        "ALTER TABLE tool_calls ADD COLUMN definition_hash TEXT",
+        "ALTER TABLE tool_calls ADD COLUMN duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0)",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -156,6 +222,11 @@ class ToolCallSummary:
     status: Literal["running", "completed", "failed", "cancelled"]
     summary: str | None
     error_code: str | None
+    source: Literal["native", "mcp"] = "native"
+    server_id: str | None = None
+    server_name: str | None = None
+    original_tool_name: str | None = None
+    duration_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +280,21 @@ class RunStatus:
     finished_at: str | None
     error_code: str | None
     pending_approval: None = None
+
+
+@dataclass(frozen=True)
+class SessionEgressRisk:
+    has_historical_file_context: bool = False
+    has_historical_rag_context: bool = False
+    has_unverifiable_history: bool = False
+
+    @property
+    def requires_egress_authorization(self) -> bool:
+        return (
+            self.has_historical_file_context
+            or self.has_historical_rag_context
+            or self.has_unverifiable_history
+        )
 
 
 class SessionNotFound(Exception):
@@ -384,13 +470,28 @@ class BusinessStore:
             run_ids = [row[0] for row in rows]
             placeholders = ", ".join("?" for _ in run_ids)
             tools_by_run: dict[str, list[ToolCallSummary]] = defaultdict(list)
-            for run_id, call_id, name, status, summary, error_code in connection.execute(
-                f"""SELECT run_id, tool_call_id, tool_name, status, summary, error_code
+            for (
+                run_id, call_id, name, status, summary, error_code,
+                source, server_id, server_name_snapshot, original_tool_name, duration_ms,
+            ) in connection.execute(
+                f"""SELECT run_id, tool_call_id, tool_name, status, summary, error_code,
+                           source, server_id, server_name_snapshot, original_tool_name, duration_ms
                     FROM tool_calls WHERE session_id = ? AND run_id IN ({placeholders})
                     ORDER BY rowid""",
                 (session_id, *run_ids),
             ):
-                tools_by_run[run_id].append(ToolCallSummary(call_id, name, status, summary, error_code))
+                tools_by_run[run_id].append(ToolCallSummary(
+                    call_id,
+                    name,
+                    status,
+                    summary,
+                    error_code,
+                    source=source,
+                    server_id=server_id,
+                    server_name=server_name_snapshot,
+                    original_tool_name=original_tool_name,
+                    duration_ms=duration_ms,
+                ))
 
             citations_by_run: dict[str, list[StoredCitation]] = defaultdict(list)
             for (
@@ -434,6 +535,99 @@ class BusinessStore:
     def require_session(self, session_id: str) -> None:
         with closing(self._connect()) as connection:
             self._require_session(connection, session_id)
+
+    def inspect_session_egress_risk(self, session_id: str) -> SessionEgressRisk:
+        """Inspect whether prior committed session context may contain protected local data
+        (read files, textbook RAG evidence, or unverifiable legacy history).
+        Does not modify database schema; reuses sessions, runs, tool_calls, run_citations, messages.
+        """
+        with closing(self._connect()) as connection:
+            session_row = connection.execute(
+                "SELECT last_safe_checkpoint_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session_row is None:
+                return SessionEgressRisk()
+
+            last_cp: str | None = session_row[0]
+            completed_rows = connection.execute(
+                """SELECT run_id, base_checkpoint_id, final_checkpoint_id
+                   FROM runs
+                   WHERE session_id = ? AND status = 'completed'""",
+                (session_id,),
+            ).fetchall()
+
+            has_unverifiable = False
+            by_final_cp: dict[str, tuple[str, str | None]] = {}
+            completed_run_ids: set[str] = set()
+            for run_id, base_cp, final_cp in completed_rows:
+                completed_run_ids.add(run_id)
+                if not final_cp:
+                    # Legacy V1/V2 completed run without checkpoint provenance -> conservative deny.
+                    has_unverifiable = True
+                else:
+                    by_final_cp[final_cp] = (run_id, base_cp)
+
+            chain_run_ids: set[str] = set()
+            if last_cp is not None:
+                cur: str | None = last_cp
+                seen_cps: set[str] = set()
+                while cur is not None:
+                    if cur in seen_cps:
+                        has_unverifiable = True
+                        break
+                    seen_cps.add(cur)
+                    entry = by_final_cp.get(cur)
+                    if entry is None:
+                        # Checkpoint chain cannot be verified against completed runs -> conservative deny.
+                        has_unverifiable = True
+                        break
+                    run_id, base_cp = entry
+                    chain_run_ids.add(run_id)
+                    cur = base_cp
+
+            # Any assistant message outside verified completed runs also marks history unverifiable.
+            assistant_run_rows = connection.execute(
+                """SELECT run_id FROM messages
+                   WHERE session_id = ? AND role = 'assistant'""",
+                (session_id,),
+            ).fetchall()
+            for (msg_run_id,) in assistant_run_rows:
+                if msg_run_id not in completed_run_ids or (last_cp is None):
+                    has_unverifiable = True
+                    break
+
+            target_run_ids = completed_run_ids | chain_run_ids
+            has_file = False
+            has_rag = False
+            if target_run_ids:
+                placeholders = ", ".join("?" for _ in target_run_ids)
+                params = (session_id, *sorted(target_run_ids))
+                for tool_name, source in connection.execute(
+                    f"""SELECT tool_name, source FROM tool_calls
+                        WHERE session_id = ? AND run_id IN ({placeholders})""",
+                    params,
+                ):
+                    if tool_name == "search_knowledge":
+                        has_rag = True
+                    elif source != "mcp":
+                        has_file = True
+
+                if not has_rag:
+                    citation_exists = connection.execute(
+                        f"""SELECT 1 FROM run_citations
+                            WHERE session_id = ? AND run_id IN ({placeholders})
+                            LIMIT 1""",
+                        params,
+                    ).fetchone()
+                    if citation_exists is not None:
+                        has_rag = True
+
+            return SessionEgressRisk(
+                has_historical_file_context=has_file,
+                has_historical_rag_context=has_rag,
+                has_unverifiable_history=has_unverifiable,
+            )
 
     @staticmethod
     def _require_session(connection: sqlite3.Connection, session_id: str) -> None:
@@ -509,23 +703,50 @@ class BusinessStore:
             return self._run_status(connection, "runs.session_id = ? AND runs.run_id = ?",
                                     (run.session_id, run.run_id))
 
-    def start_tool(self, run: Run, call_id: str, name: str) -> None:
+    def start_tool(
+        self,
+        run: Run,
+        call_id: str,
+        name: str,
+        *,
+        source: Literal["native", "mcp"] = "native",
+        server_id: str | None = None,
+        server_name_snapshot: str | None = None,
+        original_tool_name: str | None = None,
+        definition_hash: str | None = None,
+    ) -> None:
         with closing(self._connect()) as connection, self._write(connection):
             changed = connection.execute(
-                """INSERT INTO tool_calls (tool_call_id, session_id, run_id, tool_name, status, started_at)
-                   SELECT ?, session_id, run_id, ?, 'running', ? FROM runs
+                """INSERT INTO tool_calls (
+                       tool_call_id, session_id, run_id, tool_name, status, started_at,
+                       source, server_id, server_name_snapshot, original_tool_name, definition_hash
+                   )
+                   SELECT ?, session_id, run_id, ?, 'running', ?, ?, ?, ?, ?, ? FROM runs
                    WHERE session_id = ? AND run_id = ? AND status IN ('running', 'cancelling')""",
-                (call_id, name, utc_now(), run.session_id, run.run_id),
+                (
+                    call_id, name, utc_now(), source, server_id, server_name_snapshot,
+                    original_tool_name, definition_hash, run.session_id, run.run_id,
+                ),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Tool call requires an active run")
 
-    def finish_tool(self, run: Run, call_id: str, status: str, summary: str, error_code: str | None) -> None:
+    def finish_tool(
+        self,
+        run: Run,
+        call_id: str,
+        status: str,
+        summary: str,
+        error_code: str | None,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
         with closing(self._connect()) as connection, self._write(connection):
             changed = connection.execute(
-                """UPDATE tool_calls SET status = ?, summary = ?, error_code = ?, finished_at = ?
+                """UPDATE tool_calls
+                   SET status = ?, summary = ?, error_code = ?, finished_at = ?, duration_ms = ?
                    WHERE session_id = ? AND run_id = ? AND tool_call_id = ? AND status = 'running'""",
-                (status, summary, error_code, utc_now(), run.session_id, run.run_id, call_id),
+                (status, summary, error_code, utc_now(), duration_ms, run.session_id, run.run_id, call_id),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Tool call has no active audit entry")

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -5,9 +6,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 #[cfg(all(not(all(dev, debug_assertions)), not(feature = "sidecar-onefile")))]
 use tauri::Manager;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -21,10 +22,11 @@ use crate::{
     diagnostics::HostLog,
     grants::{GrantScope, GrantView},
     keychain::{
-        credential_account, validate_credential, CredentialStore, CREDENTIAL_REJECTED,
-        DEEPSEEK_PROVIDER, KEYCHAIN_ACCESS_FAILED, KEYCHAIN_CREDENTIAL_CORRUPTED,
-        SILICONFLOW_PROVIDER,
+        credential_account, validate_credential, CredentialStore, McpCredentialStore,
+        CREDENTIAL_REJECTED, DEEPSEEK_PROVIDER, KEYCHAIN_ACCESS_FAILED,
+        KEYCHAIN_CREDENTIAL_CORRUPTED, SILICONFLOW_PROVIDER,
     },
+    mcp_process,
     BackendConnection,
 };
 
@@ -38,6 +40,8 @@ const PROTOCOL_VERSION: u8 = 1;
 const MAX_READY_BYTES: u64 = 4096;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const EMBEDDING_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -82,6 +86,7 @@ pub(crate) struct Sidecar {
     closing: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
     credentials: Arc<CredentialStore>,
+    mcp_credentials: Arc<McpCredentialStore>,
 }
 
 impl Sidecar {
@@ -94,18 +99,43 @@ impl Sidecar {
         #[cfg(not(all(dev, debug_assertions)))]
         let command = bundled_command(app)?;
         let credentials = CredentialStore::for_identifier(&app.config().identifier);
-        Ok(Self::start(
+        let mcp_credentials = McpCredentialStore::for_identifier(&app.config().identifier);
+        Ok(Self::start_with_mcp(
             command,
             app_data_dir,
             credentials,
+            mcp_credentials,
             reconfigure_after_ready,
         ))
     }
 
+    #[cfg(test)]
     fn start<Fut>(
+        command: Command,
+        app_data_dir: PathBuf,
+        credentials: Arc<CredentialStore>,
+        reconfigure: impl Fn(HostConnection, Arc<CredentialStore>) -> Fut + Send + Sync + 'static,
+    ) -> Self
+    where
+        Fut: Future<Output = CredentialReplay> + Send,
+    {
+        let mcp_service = format!("{}.mcp-test", credentials.service());
+        let mcp_credentials =
+            McpCredentialStore::with_backend(mcp_service, Arc::new(NoopMcpCredentialBackend));
+        Self::start_with_mcp(
+            command,
+            app_data_dir,
+            credentials,
+            mcp_credentials,
+            reconfigure,
+        )
+    }
+
+    pub(crate) fn start_with_mcp<Fut>(
         mut command: Command,
         app_data_dir: PathBuf,
         credentials: Arc<CredentialStore>,
+        mcp_credentials: Arc<McpCredentialStore>,
         reconfigure: impl Fn(HostConnection, Arc<CredentialStore>) -> Fut + Send + Sync + 'static,
     ) -> Self
     where
@@ -122,10 +152,16 @@ impl Sidecar {
         let (closing, shutdown) = watch::channel(false);
         let (finished, stopped) = watch::channel(false);
         let replay_credentials = credentials.clone();
+        let replay_mcp_credentials = mcp_credentials.clone();
         tauri::async_runtime::spawn(async move {
-            supervise(command, app_data_dir, requests, shutdown, move |host| {
-                reconfigure(host, replay_credentials.clone())
-            })
+            supervise(
+                command,
+                app_data_dir,
+                requests,
+                shutdown,
+                replay_mcp_credentials,
+                move |host| reconfigure(host, replay_credentials.clone()),
+            )
             .await;
             let _ = finished.send(true);
         });
@@ -134,11 +170,24 @@ impl Sidecar {
             closing,
             stopped,
             credentials,
+            mcp_credentials,
         }
     }
 
     pub(crate) async fn connection(&self) -> Result<BackendConnection, &'static str> {
         Ok(self.current_connection().await?.ui)
+    }
+
+    pub(crate) async fn mcp_host_connection(&self) -> Result<HostConnection, &'static str> {
+        Ok(self.current_connection().await?.host)
+    }
+
+    pub(crate) fn mcp_credentials(&self) -> Arc<McpCredentialStore> {
+        self.mcp_credentials.clone()
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        *self.closing.borrow()
     }
 
     #[cfg(target_os = "macos")]
@@ -392,12 +441,15 @@ async fn supervise<Fut>(
     app_data_dir: PathBuf,
     mut requests: mpsc::Receiver<ConnectionReply>,
     mut closing: watch::Receiver<bool>,
+    mcp_credentials: Arc<McpCredentialStore>,
     reconfigure: impl Fn(HostConnection) -> Fut,
 ) where
     Fut: Future<Output = CredentialReplay>,
 {
     let mut pending = Vec::new();
     let log = HostLog::new(&app_data_dir);
+    // Clean expired registry files from previous host launches without signaling any PID.
+    mcp_process::cleanup_stale_registries(&app_data_dir, None, &log);
     while !*closing.borrow() {
         let running = start_sidecar(
             &mut command,
@@ -414,7 +466,9 @@ async fn supervise<Fut>(
                 for reply in pending.drain(..) {
                     let _ = reply.send(Ok(running.connection.clone()));
                 }
-                running.supervise(&mut requests, &mut closing).await;
+                running
+                    .supervise(&app_data_dir, &mcp_credentials, &mut requests, &mut closing)
+                    .await;
             }
             Err(reason) => {
                 if reason != SHUTTING_DOWN {
@@ -1022,6 +1076,401 @@ impl HostConnection {
             _ => FAILED,
         })
     }
+
+    pub(crate) fn log(&self) -> &HostLog {
+        &self.log
+    }
+
+    pub(crate) fn host_instance_id(&self) -> Uuid {
+        self.instance_id
+    }
+
+    async fn mcp_request_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        request_timeout: Duration,
+        event: &'static str,
+    ) -> Result<Value, String> {
+        #[derive(Deserialize)]
+        struct ApiErrEnvelope {
+            error: ApiErrInner,
+        }
+        #[derive(Deserialize)]
+        struct ApiErrInner {
+            code: String,
+        }
+
+        let started = Instant::now();
+        let mut builder = self
+            .client
+            .request(method, format!("{}{}", self.base_url, path))
+            .timeout(request_timeout)
+            .bearer_auth(&self.host_token);
+        if let Some(payload) = body {
+            builder = builder.json(payload);
+        }
+        let response = builder.send().await;
+        self.log_request(event, started, &response);
+        let response = response.map_err(|err| {
+            if err.is_timeout() {
+                "MCP_REQUEST_TIMEOUT".to_owned()
+            } else {
+                UNAVAILABLE.to_owned()
+            }
+        })?;
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(Value::Null);
+        }
+        if status.is_success() {
+            return response
+                .json::<Value>()
+                .await
+                .map_err(|_| "MCP_INVALID_RESPONSE".to_owned());
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            if let Ok(parsed) = response.json::<ApiErrEnvelope>().await {
+                if parsed.error.code.starts_with("MCP_") {
+                    return Err(parsed.error.code);
+                }
+            }
+            return Err("MCP_HOST_AUTH_FAILED".to_owned());
+        }
+        if let Ok(parsed) = response.json::<ApiErrEnvelope>().await {
+            return Err(parsed.error.code);
+        }
+        Err("MCP_REQUEST_FAILED".to_owned())
+    }
+
+    pub(crate) async fn get_mcp_server(&self, server_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::GET,
+            &format!("/api/v1/_host/mcp/servers/{server_id}"),
+            None,
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_get_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn create_mcp_server(&self, body: &Value) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            "/api/v1/_host/mcp/servers",
+            Some(body),
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_create_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn update_mcp_server(
+        &self,
+        server_id: &str,
+        body: &Value,
+    ) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::PATCH,
+            &format!("/api/v1/_host/mcp/servers/{server_id}"),
+            Some(body),
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_update_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn trust_mcp_server(
+        &self,
+        server_id: &str,
+        expected_config_revision: u64,
+        expected_fingerprint: &str,
+        enable: bool,
+    ) -> Result<Value, String> {
+        let body = json!({
+            "expected_config_revision": expected_config_revision,
+            "expected_fingerprint": expected_fingerprint,
+            "enable": enable,
+        });
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/trust"),
+            Some(&body),
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_trust_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn revoke_mcp_server_trust(&self, server_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/revoke-trust"),
+            None,
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_revoke_trust",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_mcp_server(&self, server_id: &str) -> Result<(), String> {
+        self.mcp_request_json(
+            Method::DELETE,
+            &format!("/api/v1/_host/mcp/servers/{server_id}"),
+            None,
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_delete_server",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn connect_mcp_server(&self, server_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/connect"),
+            None,
+            MCP_CONNECT_TIMEOUT,
+            "host_mcp_connect_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn disconnect_mcp_server(&self, server_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/disconnect"),
+            None,
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_disconnect_server",
+        )
+        .await
+    }
+
+    pub(crate) async fn refresh_mcp_tools(&self, server_id: &str) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::POST,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/refresh"),
+            None,
+            MCP_CONNECT_TIMEOUT,
+            "host_mcp_refresh_tools",
+        )
+        .await
+    }
+
+    pub(crate) async fn set_mcp_tool_permission(
+        &self,
+        server_id: &str,
+        tool_id: &str,
+        body: &Value,
+    ) -> Result<Value, String> {
+        self.mcp_request_json(
+            Method::PATCH,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/tools/{tool_id}"),
+            Some(body),
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_set_tool_permission",
+        )
+        .await
+    }
+
+    pub(crate) async fn list_mcp_credential_refs(&self) -> Result<Vec<McpCredentialRef>, String> {
+        let value = self
+            .mcp_request_json(
+                Method::GET,
+                "/api/v1/_host/mcp/credential-refs",
+                None,
+                MCP_MANAGEMENT_TIMEOUT,
+                "host_mcp_credential_refs",
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|_| "MCP_INVALID_RESPONSE".to_owned())
+    }
+
+    pub(crate) async fn put_mcp_credentials(
+        &self,
+        server_id: &str,
+        secrets: &BTreeMap<String, Zeroizing<String>>,
+        mode: &str,
+    ) -> Result<Value, String> {
+        let plain: BTreeMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let body = json!({
+            "secrets": plain,
+            "mode": mode,
+        });
+        self.mcp_request_json(
+            Method::PUT,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/credentials"),
+            Some(&body),
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_put_credentials",
+        )
+        .await
+    }
+
+    pub(crate) async fn delete_mcp_credentials(&self, server_id: &str) -> Result<(), String> {
+        self.mcp_request_json(
+            Method::DELETE,
+            &format!("/api/v1/_host/mcp/servers/{server_id}/credentials"),
+            None,
+            MCP_MANAGEMENT_TIMEOUT,
+            "host_mcp_delete_credentials",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn signal_mcp_restore_complete(&self) {
+        let _ = self
+            .mcp_request_json(
+                Method::POST,
+                "/api/v1/_host/mcp/restore-complete",
+                None,
+                MCP_MANAGEMENT_TIMEOUT,
+                "host_mcp_restore_complete",
+            )
+            .await;
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpCredentialRef {
+    pub(crate) server_id: String,
+    #[allow(dead_code)]
+    pub(crate) credential_ref: String,
+    pub(crate) secret_keys: Vec<String>,
+}
+
+#[cfg(test)]
+struct NoopMcpCredentialBackend;
+
+#[cfg(test)]
+impl crate::keychain::CredentialBackend for NoopMcpCredentialBackend {
+    fn load(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<Option<Zeroizing<String>>, crate::keychain::KeychainError> {
+        Ok(None)
+    }
+    fn save(
+        &self,
+        _service: &str,
+        _account: &str,
+        _secret: &str,
+    ) -> Result<(), crate::keychain::KeychainError> {
+        Ok(())
+    }
+    fn delete(
+        &self,
+        _service: &str,
+        _account: &str,
+    ) -> Result<(), crate::keychain::KeychainError> {
+        Ok(())
+    }
+}
+
+async fn restore_mcp_credentials_in_background(
+    host: HostConnection,
+    mcp_credentials: Arc<McpCredentialStore>,
+    mut stop: watch::Receiver<bool>,
+) {
+    if *stop.borrow() {
+        return;
+    }
+    let refs = tokio::select! {
+        biased;
+        _ = stop.changed() => return,
+        res = host.list_mcp_credential_refs() => match res {
+            Ok(list) => list,
+            Err(code) => {
+                host.log.record("mcp_restore_refs_error", json!({
+                    "instance_id": host.instance_id,
+                    "code": code,
+                }));
+                return;
+            }
+        }
+    };
+
+    for item in refs {
+        if *stop.borrow() {
+            return;
+        }
+        let loaded = {
+            let _guard = mcp_credentials.lock().await;
+            mcp_credentials.load(&item.server_id)
+        };
+        match loaded {
+            Ok(Some(all_secrets)) => {
+                // Only replay keys declared in SQLite for this server_id; ignore any orphaned keys.
+                let filtered: BTreeMap<String, Zeroizing<String>> = all_secrets
+                    .into_iter()
+                    .filter(|(k, _)| item.secret_keys.iter().any(|declared| declared == k))
+                    .collect();
+                let missing_count = item
+                    .secret_keys
+                    .iter()
+                    .filter(|k| !filtered.contains_key(*k))
+                    .count();
+                if missing_count > 0 {
+                    host.log.record(
+                        "mcp_keychain_restore_partial",
+                        json!({
+                            "instance_id": host.instance_id,
+                            "server_id": item.server_id,
+                            "missing_count": missing_count,
+                        }),
+                    );
+                }
+                if !filtered.is_empty() {
+                    if let Err(code) = host
+                        .put_mcp_credentials(&item.server_id, &filtered, "restore")
+                        .await
+                    {
+                        host.log.record(
+                            "mcp_keychain_restore_replay_error",
+                            json!({
+                                "instance_id": host.instance_id,
+                                "server_id": item.server_id,
+                                "code": code,
+                            }),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                host.log.record(
+                    "mcp_keychain_restore_missing",
+                    json!({
+                        "instance_id": host.instance_id,
+                        "server_id": item.server_id,
+                    }),
+                );
+            }
+            Err(error) => {
+                host.log.record(
+                    "mcp_keychain_restore_read_error",
+                    json!({
+                        "instance_id": host.instance_id,
+                        "server_id": item.server_id,
+                        "service": mcp_credentials.service(),
+                        "reason": error.diagnostic_reason(),
+                        "os_status": error.os_status(),
+                    }),
+                );
+            }
+        }
+    }
+
+    if !*stop.borrow() {
+        host.signal_mcp_restore_complete().await;
+    }
 }
 
 async fn reconfigure_after_ready(
@@ -1095,16 +1544,32 @@ struct RunningSidecar {
 impl RunningSidecar {
     async fn supervise(
         mut self,
+        app_data_dir: &Path,
+        mcp_credentials: &Arc<McpCredentialStore>,
         requests: &mut mpsc::Receiver<ConnectionReply>,
         closing: &mut watch::Receiver<bool>,
     ) {
+        let sidecar_pid = self.child.id();
+        let instance_id = self.connection.host.instance_id;
+        let log = self.connection.host.log.clone();
+
+        // Spawn non-blocking background MCP credential recovery after Sidecar is ready.
+        let (restore_cancel_tx, restore_cancel_rx) = watch::channel(false);
+        let restore_task = tauri::async_runtime::spawn(restore_mcp_credentials_in_background(
+            self.connection.host.clone(),
+            mcp_credentials.clone(),
+            restore_cancel_rx,
+        ));
+
         loop {
             tokio::select! {
                 biased;
                 _ = closing.changed() => break,
                 result = self.child.wait() => {
+                    let _ = restore_cancel_tx.send(true);
+                    restore_task.abort();
                     self.connection.host.log.record("sidecar_exited", json!({
-                        "instance_id": self.connection.host.instance_id,
+                        "instance_id": instance_id,
                         "success": result.as_ref().is_ok_and(|status| status.success()),
                     }));
                     match result {
@@ -1114,6 +1579,15 @@ impl RunningSidecar {
                             wait_or_terminate(&mut self.child).await;
                         }
                     }
+                    // Host-level supervision: reap any verified stdio MCP process groups left behind
+                    // if Sidecar crashed or received SIGKILL.
+                    let _ = mcp_process::reap_instance_processes(
+                        app_data_dir,
+                        instance_id,
+                        sidecar_pid,
+                        &log,
+                    )
+                    .await;
                     return;
                 },
                 request = requests.recv() => match request {
@@ -1123,6 +1597,9 @@ impl RunningSidecar {
             }
         }
 
+        let _ = restore_cancel_tx.send(true);
+        restore_task.abort();
+
         if self.connection.host.request_shutdown().await {
             eprintln!("KnowledgeAgent Sidecar: host shutdown acknowledged.");
         } else {
@@ -1130,6 +1607,14 @@ impl RunningSidecar {
         }
         drop(self.stdin);
         wait_or_terminate(&mut self.child).await;
+        // Post-shutdown safety check: reap any stubborn MCP child group if Sidecar had to be SIGKILL'd.
+        let _ = mcp_process::reap_instance_processes(
+            app_data_dir,
+            instance_id,
+            sidecar_pid,
+            &log,
+        )
+        .await;
     }
 }
 

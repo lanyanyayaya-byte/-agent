@@ -791,7 +791,7 @@ async def test_v3_migration_preserves_rows_and_recovers_pending_tool_audit(tmp_p
             "INSERT INTO messages VALUES (?, ?, ?, 'user', '原始问题', 't')", (message_id, session_id, run_id),
         )
     store = BusinessStore(path)
-    assert rows(path, "PRAGMA user_version") == [(5,)]
+    assert rows(path, "PRAGMA user_version") == [(6,)]
     assert rows(path, "SELECT message_id, content FROM messages") == [(message_id, "原始问题")]
     call_id = str(uuid4())
     store.start_tool(Run(session_id, run_id, request_id, None), call_id, "read_text")

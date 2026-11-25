@@ -30,6 +30,7 @@ from app.mcp.models import (
     ServerRuntimeState,
 )
 from app.mcp.policy import compute_config_trust_fingerprint, redact_text, validate_server_config
+from app.mcp.process_registry import McpProcessRegistry
 
 
 def _utc_now() -> str:
@@ -42,6 +43,7 @@ class _CallRequest:
     arguments: dict[str, Any]
     timeout_seconds: float | None
     future: asyncio.Future[McpToolCallResult]
+    before_dispatch: Callable[[], None] | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: bool = False
 
@@ -63,6 +65,8 @@ class _ServerActor:
         limits: McpRuntimeLimits,
         connect_semaphore: asyncio.Semaphore,
         on_catalog_updated: Callable[[str, tuple[McpToolDefinition, ...], int], None] | None,
+        on_catalog_event: Callable[[str, tuple[McpToolDefinition, ...], int, int, int, bool], None] | None = None,
+        process_registry: McpProcessRegistry | None = None,
     ) -> None:
         self._slot = slot
         self._config = config
@@ -70,6 +74,8 @@ class _ServerActor:
         self._limits = limits
         self._connect_semaphore = connect_semaphore
         self._on_catalog_updated = on_catalog_updated
+        self._on_catalog_event = on_catalog_event
+        self._process_registry = process_registry
 
         self._loop = asyncio.get_running_loop()
         self.ready: asyncio.Future[McpDiagnostics] = self._loop.create_future()
@@ -89,20 +95,35 @@ class _ServerActor:
         )
 
     def _is_current(self) -> bool:
-        return self._slot.generation == self.generation
+        return (
+            self._slot.generation == self.generation
+            and self._slot.actor is self
+            and not self._slot.removed
+        )
+
+    def _can_publish(self) -> bool:
+        return self._is_current() and not self._stop_event.is_set()
 
     def request_stop(self) -> None:
         self._stop_event.set()
         self._wakeup_event.set()
+        self.cancel_pending_calls()
+
+    def cancel_pending_calls(self) -> None:
         if self._active_call is not None:
             self._active_call.cancelled = True
             self._active_call.cancel_event.set()
+        for req in self._call_queue:
+            req.cancelled = True
+            req.cancel_event.set()
 
     def enqueue_call(
         self,
         tool_name: str,
         arguments: dict[str, Any],
         timeout_seconds: float | None,
+        *,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> _CallRequest:
         if self._stop_event.is_set() or self._transport_closed_event.is_set() or self.task.done():
             raise McpError("MCP_SERVER_UNAVAILABLE")
@@ -115,6 +136,7 @@ class _ServerActor:
             arguments=arguments,
             timeout_seconds=timeout_seconds,
             future=self._loop.create_future(),
+            before_dispatch=before_dispatch,
         )
         self._call_queue.append(req)
         self._wakeup_event.set()
@@ -129,9 +151,22 @@ class _ServerActor:
         return req.future
 
     def _on_tools_changed(self) -> None:
-        if self._stop_event.is_set() or not self._is_current():
+        if not self._can_publish():
             return
+        # Immediately invalidate live catalog during refresh so stale tool definitions cannot be used.
+        self._slot.catalog_stale = True
+        self._slot.tools = ()
         self._pending_list_changed = True
+        if self._on_catalog_event is not None:
+            with suppress(Exception):
+                self._on_catalog_event(
+                    self._config.server_id,
+                    (),
+                    self.generation,
+                    self._slot.catalog_version,
+                    self._config.config_revision,
+                    True,
+                )
         self._wakeup_event.set()
 
     def _on_transport_closed(self, error: McpError | None) -> None:
@@ -174,9 +209,10 @@ class _ServerActor:
                 generation=self.generation,
                 on_tools_changed=self._on_tools_changed,
                 on_transport_closed=self._on_transport_closed,
+                process_registry=self._process_registry,
             ) as conn:
                 self._conn = conn
-                if self._is_current():
+                if self._can_publish():
                     self._slot.resolved_command = conn.resolved_command
                     self._slot.child_pid = conn.child_pid
                     self._slot.protocol_version = conn.protocol_version
@@ -195,20 +231,31 @@ class _ServerActor:
                         self.ready.set_exception(McpError("MCP_SERVER_UNAVAILABLE", "连接已取消。"))
                     return
 
-                if self._is_current():
-                    self._slot.tools = tools
+                if self._can_publish():
+                    self._slot.tools = () if self._pending_list_changed else tools
                     self._slot.tools_truncated = truncated
+                    self._slot.catalog_stale = self._pending_list_changed
                     self._slot.catalog_version += 1
                     self._slot.state = "connected"
                     self._slot.connected_at = _utc_now()
                     self._slot.last_error_code = None
                     self._slot.last_error_message = None
-                    if self._on_catalog_updated is not None:
+                    if self._on_catalog_updated is not None and not self._slot.catalog_stale:
                         with suppress(Exception):
                             self._on_catalog_updated(
                                 self._config.server_id,
                                 tools,
                                 self._slot.catalog_version,
+                            )
+                    if self._on_catalog_event is not None:
+                        with suppress(Exception):
+                            self._on_catalog_event(
+                                self._config.server_id,
+                                self._slot.tools,
+                                self.generation,
+                                self._slot.catalog_version,
+                                self._config.config_revision,
+                                self._slot.catalog_stale,
                             )
 
                 diag = self._slot.snapshot()
@@ -248,10 +295,12 @@ class _ServerActor:
                 if self._stop_event.is_set():
                     self._slot.state = "disconnected"
                     self._slot.tools = ()
+                    self._slot.catalog_stale = False
                     self._slot.tools_truncated = False
                 else:
                     self._slot.state = "error"
                     self._slot.tools = ()
+                    self._slot.catalog_stale = False
                     self._slot.tools_truncated = False
                     if final_error is not None:
                         self._slot.last_error_code = final_error.code
@@ -295,12 +344,34 @@ class _ServerActor:
         while self._refresh_queue:
             waiters.append(self._refresh_queue.popleft())
         self._pending_list_changed = False
+        if self._can_publish():
+            self._slot.catalog_stale = True
+            self._slot.tools = ()
 
         try:
             tools, truncated = await conn.list_tools()
             self._sync_stderr()
         except McpError as exc:
             self._sync_stderr()
+            # Safe degradation on refresh failure: keep catalog empty & stale so old definitions cannot be used.
+            if self._can_publish():
+                self._slot.tools = ()
+                self._slot.catalog_stale = True
+                self._slot.last_error_code = exc.code
+                self._slot.last_error_message = redact_text(
+                    exc.message,
+                    secrets=self._config.all_secret_values(),
+                )
+                if self._on_catalog_event is not None:
+                    with suppress(Exception):
+                        self._on_catalog_event(
+                            self._config.server_id,
+                            (),
+                            self.generation,
+                            self._slot.catalog_version,
+                            self._config.config_revision,
+                            True,
+                        )
             for waiter in waiters:
                 if not waiter.future.done():
                     waiter.future.set_exception(exc)
@@ -309,22 +380,56 @@ class _ServerActor:
                 self._transport_closed_event.set()
             return
 
-        if self._is_current():
-            self._slot.tools = tools
+        if self._can_publish():
+            still_stale = self._pending_list_changed
+            self._slot.tools = () if still_stale else tools
             self._slot.tools_truncated = truncated
+            self._slot.catalog_stale = still_stale
             self._slot.catalog_version += 1
-            if self._on_catalog_updated is not None:
+            if not still_stale:
+                self._slot.last_error_code = None
+                self._slot.last_error_message = None
+            if self._on_catalog_updated is not None and not still_stale:
                 with suppress(Exception):
                     self._on_catalog_updated(
                         self._config.server_id,
                         tools,
                         self._slot.catalog_version,
                     )
+            if self._on_catalog_event is not None:
+                with suppress(Exception):
+                    self._on_catalog_event(
+                        self._config.server_id,
+                        self._slot.tools,
+                        self.generation,
+                        self._slot.catalog_version,
+                        self._config.config_revision,
+                        still_stale,
+                    )
         for waiter in waiters:
             if not waiter.future.done():
                 waiter.future.set_result(tools)
 
     async def _execute_call(self, conn: McpClientConnection, req: _CallRequest) -> None:
+        if req.cancelled or req.future.done():
+            if not req.future.done():
+                req.future.set_exception(McpError("MCP_TOOL_CANCELLED"))
+            return
+        if self._slot.catalog_stale or not self._can_publish():
+            req.future.set_exception(McpError("MCP_SERVER_UNAVAILABLE", "MCP 工具目录已失效或服务已断开。"))
+            return
+        if req.before_dispatch is not None:
+            try:
+                req.before_dispatch()
+            except McpError as exc:
+                if not req.future.done():
+                    req.future.set_exception(exc)
+                return
+            except Exception:
+                if not req.future.done():
+                    req.future.set_exception(McpError("MCP_PERMISSION_DENIED"))
+                return
+
         self._active_call = req
         call_task = asyncio.create_task(
             conn.call_tool(
@@ -398,7 +503,9 @@ class _ServerSlot:
     child_pid: int | None = None
     tools: tuple[McpToolDefinition, ...] = ()
     catalog_version: int = 0
+    catalog_stale: bool = False
     tools_truncated: bool = False
+    removed: bool = False
     last_error_code: McpErrorCode | None = None
     last_error_message: str | None = None
     stderr_tail: tuple[str, ...] = ()
@@ -418,6 +525,7 @@ class _ServerSlot:
             child_pid=self.child_pid,
             tool_count=len(self.tools),
             catalog_version=self.catalog_version,
+            catalog_stale=self.catalog_stale,
             tools_truncated=self.tools_truncated,
             last_error_code=self.last_error_code,
             last_error_message=self.last_error_message,
@@ -434,9 +542,13 @@ class McpManager:
         *,
         limits: McpRuntimeLimits | None = None,
         on_catalog_updated: Callable[[str, tuple[McpToolDefinition, ...], int], None] | None = None,
+        on_catalog_event: Callable[[str, tuple[McpToolDefinition, ...], int, int, int, bool], None] | None = None,
+        process_registry: McpProcessRegistry | None = None,
     ) -> None:
         self.limits = limits or McpRuntimeLimits()
         self._on_catalog_updated = on_catalog_updated
+        self._on_catalog_event = on_catalog_event
+        self._process_registry = process_registry
         self._slots: dict[str, _ServerSlot] = {}
         self._connect_semaphore = asyncio.Semaphore(self.limits.max_connect_concurrency)
         self._shutting_down = False
@@ -466,10 +578,15 @@ class McpManager:
             return slot.snapshot()
 
         async with existing.lock:
-            security_changed = existing.fingerprint != fingerprint or existing.config.secret_env != config.secret_env or existing.config.secret_headers != config.secret_headers
+            security_changed = (
+                existing.fingerprint != fingerprint
+                or existing.config.config_revision != config.config_revision
+                or existing.config.secret_env != config.secret_env
+                or existing.config.secret_headers != config.secret_headers
+            )
             existing.config = config
             existing.fingerprint = fingerprint
-            if security_changed and existing.actor is not None:
+            if (security_changed or not config.enabled) and existing.actor is not None:
                 await self._disconnect_locked(existing)
             return existing.snapshot()
 
@@ -478,9 +595,26 @@ class McpManager:
         slot = self._slots.get(server_id)
         if slot is None:
             return
+        slot.removed = True
+        if slot.actor is not None:
+            slot.actor.request_stop()
         async with slot.lock:
             await self._disconnect_locked(slot)
             self._slots.pop(server_id, None)
+
+    def cancel_server_calls(self, server_id: str) -> None:
+        """Best-effort cancellation of active and queued tool calls on a server."""
+        slot = self._slots.get(server_id)
+        if slot is not None and slot.actor is not None:
+            slot.actor.cancel_pending_calls()
+
+    def get_active_generation(self, server_id: str) -> int:
+        slot = self._slots.get(server_id)
+        return slot.generation if slot is not None else 0
+
+    def is_catalog_stale(self, server_id: str) -> bool:
+        slot = self._slots.get(server_id)
+        return slot.catalog_stale if slot is not None else False
 
     def list_servers(self) -> list[McpDiagnostics]:
         return [slot.snapshot() for slot in self._slots.values()]
@@ -490,7 +624,7 @@ class McpManager:
 
     def list_tools(self, server_id: str) -> tuple[McpToolDefinition, ...]:
         slot = self._require_slot(server_id)
-        if slot.state != "connected":
+        if slot.state != "connected" or slot.catalog_stale:
             return ()
         return slot.tools
 
@@ -510,9 +644,10 @@ class McpManager:
                 if slot.actor is not None:
                     await self._disconnect_locked(slot)
                 if self._active_server_count() >= self.limits.max_active_servers:
-                    raise McpError("MCP_SERVER_BUSY", f"同时活跃的 MCP 服务已达上限（{self.limits.max_active_servers}）。")
+                    raise McpError("MCP_ACTIVE_SERVER_LIMIT", f"同时活跃的 MCP 服务已达上限（{self.limits.max_active_servers}）。")
                 slot.generation += 1
                 slot.state = "connecting"
+                slot.catalog_stale = False
                 slot.last_error_code = None
                 slot.last_error_message = None
                 slot.stderr_tail = ()
@@ -523,6 +658,8 @@ class McpManager:
                     limits=self.limits,
                     connect_semaphore=self._connect_semaphore,
                     on_catalog_updated=self._on_catalog_updated,
+                    on_catalog_event=self._on_catalog_event,
+                    process_registry=self._process_registry,
                 )
                 slot.actor = actor
 
@@ -546,6 +683,7 @@ class McpManager:
         if actor is None:
             slot.state = "disconnected"
             slot.tools = ()
+            slot.catalog_stale = False
             slot.tools_truncated = False
             slot.child_pid = None
             slot.connected_at = None
@@ -565,6 +703,7 @@ class McpManager:
                 slot.actor = None
             slot.state = "disconnected"
             slot.tools = ()
+            slot.catalog_stale = False
             slot.tools_truncated = False
             slot.child_pid = None
             slot.connected_at = None
@@ -587,6 +726,7 @@ class McpManager:
         arguments: dict[str, Any] | None = None,
         *,
         timeout_seconds: float | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ) -> McpToolCallResult:
         """Invoke a tool on a connected server (serial per server, zero auto-retry)."""
         if self._shutting_down:
@@ -595,11 +735,14 @@ class McpManager:
         actor = slot.actor
         if slot.state != "connected" or actor is None or actor.task.done():
             raise McpError("MCP_SERVER_UNAVAILABLE")
+        if slot.catalog_stale:
+            raise McpError("MCP_SERVER_UNAVAILABLE", "MCP 工具目录正在刷新或刷新失败，禁止使用可能失效的旧定义。")
 
         req = actor.enqueue_call(
             tool_name=tool_name,
             arguments=dict(arguments) if arguments is not None else {},
             timeout_seconds=timeout_seconds,
+            before_dispatch=before_dispatch,
         )
         try:
             return await asyncio.shield(req.future)
@@ -643,6 +786,9 @@ class McpManager:
                 slot.actor = None
             slot.state = "disconnected"
             slot.tools = ()
+            slot.catalog_stale = False
             slot.tools_truncated = False
             slot.child_pid = None
             slot.connected_at = None
+        if self._process_registry is not None:
+            self._process_registry.clear_instance()

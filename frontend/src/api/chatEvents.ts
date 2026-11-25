@@ -26,12 +26,22 @@ export type StoredCitation = {
   parse_spec_current: boolean;
 };
 
+export type ToolSource = 'native' | 'mcp';
+
+export type ToolEventMetadata = {
+  source?: ToolSource;
+  server_id?: string | null;
+  server_name?: string | null;
+  original_tool_name?: string | null;
+  duration_ms?: number | null;
+};
+
 export type RunEvent = Envelope & (
   | { type: 'run_started'; data: { client_request_id: string } }
   | { type: 'message_delta'; data: { delta: string } }
-  | { type: 'tool_started'; data: { tool_call_id: string; tool_name: string } }
-  | { type: 'tool_completed'; data: { tool_call_id: string; summary: string } }
-  | { type: 'tool_failed'; data: { tool_call_id: string; code: string; message: string } }
+  | { type: 'tool_started'; data: { tool_call_id: string; tool_name: string } & Omit<ToolEventMetadata, 'duration_ms'> }
+  | { type: 'tool_completed'; data: { tool_call_id: string; summary: string } & ToolEventMetadata }
+  | { type: 'tool_failed'; data: { tool_call_id: string; code: string; message: string } & ToolEventMetadata }
   | {
       type: 'run_citations';
       data: {
@@ -48,6 +58,20 @@ export type RunEvent = Envelope & (
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function parseToolMetadata(data: Record<string, unknown>, includeDuration: boolean): ToolEventMetadata {
+  const meta: ToolEventMetadata = {};
+  if (data.source === 'native' || data.source === 'mcp') meta.source = data.source;
+  if (typeof data.server_id === 'string' || data.server_id === null) meta.server_id = data.server_id;
+  if (typeof data.server_name === 'string' || data.server_name === null) meta.server_name = data.server_name;
+  if (typeof data.original_tool_name === 'string' || data.original_tool_name === null) {
+    meta.original_tool_name = data.original_tool_name;
+  }
+  if (includeDuration && (typeof data.duration_ms === 'number' || data.duration_ms === null)) {
+    meta.duration_ms = data.duration_ms;
+  }
+  return meta;
 }
 
 export function parseRunEvent(value: unknown): RunEvent | undefined {
@@ -71,18 +95,43 @@ export function parseRunEvent(value: unknown): RunEvent | undefined {
       break;
     case 'tool_started':
       if (typeof data.tool_call_id === 'string' && data.tool_call_id && typeof data.tool_name === 'string') {
-        return { ...envelope, type, data: { tool_call_id: data.tool_call_id, tool_name: data.tool_name } };
+        return {
+          ...envelope,
+          type,
+          data: {
+            tool_call_id: data.tool_call_id,
+            tool_name: data.tool_name,
+            ...parseToolMetadata(data, false),
+          },
+        };
       }
       break;
     case 'tool_completed':
       if (typeof data.tool_call_id === 'string' && data.tool_call_id && typeof data.summary === 'string') {
-        return { ...envelope, type, data: { tool_call_id: data.tool_call_id, summary: data.summary } };
+        return {
+          ...envelope,
+          type,
+          data: {
+            tool_call_id: data.tool_call_id,
+            summary: data.summary,
+            ...parseToolMetadata(data, true),
+          },
+        };
       }
       break;
     case 'tool_failed':
       if (typeof data.tool_call_id === 'string' && data.tool_call_id
         && typeof data.code === 'string' && typeof data.message === 'string') {
-        return { ...envelope, type, data: { tool_call_id: data.tool_call_id, code: data.code, message: data.message } };
+        return {
+          ...envelope,
+          type,
+          data: {
+            tool_call_id: data.tool_call_id,
+            code: data.code,
+            message: data.message,
+            ...parseToolMetadata(data, true),
+          },
+        };
       }
       break;
     case 'run_citations':

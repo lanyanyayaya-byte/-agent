@@ -11,6 +11,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 afterEach(() => {
   cleanup();
   sessionStorage.clear();
+  localStorage.clear();
   vi.resetAllMocks();
   vi.unstubAllGlobals();
 });
@@ -44,6 +45,17 @@ async function setup() {
     const path = pathname.slice('/api/v1'.length);
     const override = overrides.get(path);
     if (override) return override();
+    if (path === '/mcp/summary') {
+      return Response.json({
+        total_servers: 0,
+        enabled_servers: 0,
+        connected_servers: 0,
+        error_servers: 0,
+        effective_allowed_tools: 0,
+        max_tools_per_run: 32,
+        exceeds_tool_limit: false,
+      });
+    }
     if (path === '/sessions') {
       if (options.method === 'GET') return Response.json(sessions);
       const session = { session_id: String(sessions.length + 1), title: JSON.parse(String(options.body)).title };
@@ -394,4 +406,273 @@ test('supports RAG textbook Q&A mode, renders structured citations and persisted
     turn.push('run_completed', { message_id: 'saved-run-rag' });
   });
   expect(await screen.findByLabelText('已保存回答')).toBeTruthy();
+});
+
+test('sends explicit mcp options, keeps RAG and MCP switches independent, and restores MCP tool cards from SSE and history', async () => {
+  const { client, create, overrides, calls, runs, messages } = await setup();
+  overrides.set('/mcp/summary', () => Response.json({
+    total_servers: 1,
+    enabled_servers: 1,
+    connected_servers: 1,
+    error_servers: 0,
+    effective_allowed_tools: 3,
+    max_tools_per_run: 32,
+    exceeds_tool_limit: false,
+  }));
+
+  render(<Chat client={client} modelConfigured />);
+  await create();
+
+  // MCP defaults to OFF and displays real available tool count from summary
+  const mcpToggle = screen.getByLabelText<HTMLInputElement>('启用 MCP 工具');
+  const ragToggle = screen.getByLabelText<HTMLInputElement>('结合教材知识库');
+  expect(mcpToggle.checked).toBe(false);
+  expect(ragToggle.checked).toBe(false);
+  expect(await screen.findByText('MCP 工具（3 个可用）')).toBeTruthy();
+
+  // Sending with MCP OFF explicitly sends { mcp: { enabled: false, allow_external_data_egress: false } }
+  let streamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+  overrides.set('/sessions/1/runs/stream', () => {
+    const stream = new ReadableStream<Uint8Array>({ start(c) { streamCtrl = c; } });
+    return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  fireEvent.change(screen.getByLabelText('问题'), { target: { value: '普通聊天消息' } });
+  fireEvent.click(screen.getByRole('button', { name: '发送' }));
+  await waitFor(() => expect(calls('POST').some(([u]) => u.includes('/runs/stream'))).toBe(true));
+  const offBody = JSON.parse(String(calls('POST').at(-1)?.[1].body));
+  expect(offBody.mcp).toEqual({ enabled: false, allow_external_data_egress: false });
+  expect(offBody.knowledge).toBeUndefined();
+
+  const pushOff = (type: string, data: object) => streamCtrl.enqueue(new TextEncoder().encode(
+    `data: ${JSON.stringify({ version: 1, type, session_id: '1', run_id: 'r-off', ts: timestamp, data })}\n\n`,
+  ));
+  await act(async () => {
+    pushOff('run_started', { client_request_id: offBody.client_request_id });
+    const doneRun = run('1', 'r-off', 'completed');
+    runs.unshift(doneRun);
+    messages.push(message(doneRun, '普通聊天消息'));
+    messages.push(message(doneRun, '普通回复', 'assistant'));
+    pushOff('run_completed', { message_id: 'saved-r-off' });
+  });
+  expect(await screen.findByText('普通回复')).toBeTruthy();
+
+  // Toggle MCP ON independently (RAG stays OFF) -> remembered in localStorage
+  fireEvent.click(mcpToggle);
+  expect(mcpToggle.checked).toBe(true);
+  expect(ragToggle.checked).toBe(false);
+  expect(localStorage.getItem('knowledgeagent.mcp_enabled')).toBe('true');
+
+  fireEvent.change(screen.getByLabelText('问题'), { target: { value: '调用外部 MCP 工具' } });
+  fireEvent.click(screen.getByRole('button', { name: '发送' }));
+  await waitFor(() => {
+    const postStreams = calls('POST').filter(([u]) => u.includes('/runs/stream'));
+    expect(postStreams).toHaveLength(2);
+  });
+  const onBody = JSON.parse(String(calls('POST').filter(([u]) => u.includes('/runs/stream')).at(-1)?.[1].body));
+  expect(onBody.mcp).toEqual({ enabled: true, allow_external_data_egress: false });
+
+  // Stream SSE MCP tool_started + tool_completed with source/server_name/original_tool_name/duration_ms
+  const pushOn = (type: string, data: object) => streamCtrl.enqueue(new TextEncoder().encode(
+    `data: ${JSON.stringify({ version: 1, type, session_id: '1', run_id: 'r-mcp', ts: timestamp, data })}\n\n`,
+  ));
+  await act(async () => {
+    pushOn('run_started', { client_request_id: onBody.client_request_id });
+    pushOn('tool_started', {
+      tool_call_id: 'mcp-call-1',
+      tool_name: 'mcp__srv_1__echo_text',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Test MCP',
+      original_tool_name: 'echo_text',
+    });
+  });
+  const liveCard = screen.getByRole('list', { name: '工具执行' }).textContent ?? '';
+  expect(liveCard).toContain('MCP');
+  expect(liveCard).toContain('Local Test MCP');
+  expect(liveCard).toContain('echo_text');
+  expect(liveCard).toContain('执行中');
+
+  // Toggling MCP OFF mid-run does not break the active run
+  fireEvent.click(mcpToggle);
+  expect(mcpToggle.checked).toBe(false);
+
+  const savedMcpRun: RunSummary = {
+    ...run('1', 'r-mcp', 'completed'),
+    tool_calls: [{
+      tool_call_id: 'mcp-call-1',
+      tool_name: 'mcp__srv_1__echo_text',
+      status: 'completed',
+      summary: 'MCP 工具返回 42 字符。',
+      error_code: null,
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Test MCP',
+      original_tool_name: 'echo_text',
+      duration_ms: 840,
+    }],
+  };
+  runs.unshift(savedMcpRun);
+  messages.push(message(savedMcpRun, '调用外部 MCP 工具'));
+  messages.push(message(savedMcpRun, 'MCP 工具回答完成。', 'assistant'));
+
+  await act(async () => {
+    pushOn('tool_completed', {
+      tool_call_id: 'mcp-call-1',
+      summary: 'MCP 工具返回 42 字符。',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Test MCP',
+      original_tool_name: 'echo_text',
+      duration_ms: 840,
+    });
+    pushOn('run_completed', { message_id: 'saved-r-mcp' });
+  });
+
+  expect(await screen.findByText('MCP 工具回答完成。')).toBeTruthy();
+
+  // Reopen / remount Chat to verify historical MCP tool call card restoration from SQLite runs
+  cleanup();
+  render(<Chat client={client} modelConfigured />);
+  expect(await screen.findByText('MCP 工具回答完成。')).toBeTruthy();
+  const restored = screen.getByRole('list', { name: '工具执行' }).textContent ?? '';
+  expect(restored).toContain('MCP');
+  expect(restored).toContain('Local Test MCP');
+  expect(restored).toContain('echo_text');
+  expect(restored).toContain('已完成');
+  expect(restored).toContain('840ms');
+  expect(restored).toContain('MCP 工具返回 42 字符。');
+});
+
+test('requires non-persistent one-turn egress confirmation for RAG+MCP, historical protected turns, and backend 403 without auto-retry', async () => {
+  const { client, create, overrides, calls, runs, messages } = await setup();
+  overrides.set('/mcp/summary', () => Response.json({
+    total_servers: 1,
+    enabled_servers: 1,
+    connected_servers: 1,
+    error_servers: 0,
+    effective_allowed_tools: 2,
+    max_tools_per_run: 32,
+    exceeds_tool_limit: false,
+  }));
+  overrides.set('/knowledge/documents', () => Response.json([]));
+
+  let streamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+  overrides.set('/sessions/1/runs/stream', () => {
+    const stream = new ReadableStream<Uint8Array>({ start(c) { streamCtrl = c; } });
+    return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+
+  render(<Chat client={client} modelConfigured />);
+  await create();
+
+  // Turn ON both RAG and MCP
+  fireEvent.click(screen.getByLabelText('结合教材知识库'));
+  fireEvent.click(screen.getByLabelText('启用 MCP 工具'));
+
+  // Attempt send -> MUST open confirmation dialog instead of calling backend!
+  fireEvent.change(screen.getByLabelText('问题'), { target: { value: '结合教材与外部工具分析' } });
+  fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+  const dialog = await screen.findByRole('dialog', { name: '本轮外部数据外发确认' });
+  expect(dialog.textContent).toContain('当前对话可能包含本地文件或教材内容');
+  expect(screen.getByRole('button', { name: '关闭教材 RAG' })).toBeTruthy();
+  expect(calls('POST').filter(([u]) => u.includes('/runs/stream'))).toHaveLength(0);
+
+  // Confirm one-turn egress -> sends allow_external_data_egress: true ONCE, never persists to localStorage
+  fireEvent.click(screen.getByRole('button', { name: '仅本轮授权必要的数据外发' }));
+  await waitFor(() => expect(calls('POST').filter(([u]) => u.includes('/runs/stream'))).toHaveLength(1));
+  const firstBody = JSON.parse(String(calls('POST').filter(([u]) => u.includes('/runs/stream'))[0][1].body));
+  expect(firstBody.mcp).toEqual({ enabled: true, allow_external_data_egress: true });
+  expect(JSON.stringify(localStorage)).not.toContain('allow_external_data_egress');
+
+  // Complete turn 1 with a historical search_knowledge tool call
+  const ragHistoryRun: RunSummary = {
+    ...run('1', 'r-rag-1', 'completed'),
+    tool_calls: [{
+      tool_call_id: 'rag-tc-1',
+      tool_name: 'search_knowledge',
+      status: 'completed',
+      summary: '命中 1 条教材证据。',
+      error_code: null,
+      source: 'native',
+    }],
+  };
+  runs.unshift(ragHistoryRun);
+  messages.push(message(ragHistoryRun, '结合教材与外部工具分析'));
+  messages.push(message(ragHistoryRun, '第一轮结合教材完成。', 'assistant'));
+  await act(async () => {
+    const push = (type: string, data: object) => streamCtrl.enqueue(new TextEncoder().encode(
+      `data: ${JSON.stringify({ version: 1, type, session_id: '1', run_id: 'r-rag-1', ts: timestamp, data })}\n\n`,
+    ));
+    push('run_started', { client_request_id: firstBody.client_request_id });
+    push('run_completed', { message_id: 'saved-r-rag-1' });
+  });
+  expect(await screen.findByText('第一轮结合教材完成。')).toBeTruthy();
+
+  // Turn OFF RAG on Turn 2 -> cross-turn historical RAG context STILL requires confirmation,
+  // and MUST NOT offer "关闭教材 RAG" as a fix because history is already tainted!
+  fireEvent.click(screen.getByLabelText('结合教材知识库'));
+  fireEvent.change(screen.getByLabelText('问题'), { target: { value: '第二轮继续问' } });
+  fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+  const histDialog = await screen.findByRole('dialog', { name: '本轮外部数据外发确认' });
+  expect(histDialog.textContent).toContain('会话历史包含教材检索上下文');
+  expect(screen.queryByRole('button', { name: '关闭教材 RAG' })).toBeNull();
+  expect(calls('POST').filter(([u]) => u.includes('/runs/stream'))).toHaveLength(1);
+
+  // Start a new clean session via the dialog button -> preserves draft input!
+  fireEvent.click(screen.getByRole('button', { name: '开启新对话' }));
+  await waitFor(() => expect(screen.getByLabelText<HTMLTextAreaElement>('问题').value).toBe('第二轮继续问'));
+
+  // Simulate backend returning 403 MCP_EGRESS_AUTHORIZATION_REQUIRED (e.g., legacy unverifiable session)
+  overrides.set('/sessions/2/runs/stream', () => Response.json(
+    { error: { code: 'MCP_EGRESS_AUTHORIZATION_REQUIRED', message: '旧版本历史上下文需要授权外发。' } },
+    { status: 403 },
+  ));
+  const sendBtn = screen.getByRole<HTMLButtonElement>('button', { name: '发送' });
+  await waitFor(() => expect(sendBtn.disabled).toBe(false));
+  fireEvent.click(sendBtn);
+
+  // Must preserve user input, show dialog, and NEVER auto-retry!
+  const backendDialog = await screen.findByRole('dialog', { name: '本轮外部数据外发确认' });
+  expect(backendDialog.textContent).toContain('旧版本历史上下文需要授权外发。');
+  expect(screen.getByLabelText<HTMLTextAreaElement>('问题').value).toBe('第二轮继续问');
+  expect(calls('POST').filter(([u]) => u.includes('/sessions/2/runs/stream'))).toHaveLength(1);
+});
+
+test('shows tool limit warning, distinct Chinese MCP error messages with jump link, and keeps plain chat working when MCP summary fails', async () => {
+  const { client, create, overrides, runs, messages } = await setup();
+  const onOpenMcp = vi.fn();
+
+  // 1) Over-limit summary warning + jump button
+  overrides.set('/mcp/summary', () => Response.json({
+    total_servers: 2,
+    enabled_servers: 2,
+    connected_servers: 2,
+    error_servers: 0,
+    effective_allowed_tools: 35,
+    max_tools_per_run: 32,
+    exceeds_tool_limit: true,
+  }));
+
+  render(<Chat client={client} modelConfigured onOpenMcpPanel={onOpenMcp} />);
+  await create();
+  fireEvent.click(screen.getByLabelText('启用 MCP 工具'));
+  expect(await screen.findByText(/超过单轮上限（32）/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '管理 MCP 工具' }));
+  expect(onOpenMcp).toHaveBeenCalledTimes(1);
+
+  // 2) Distinct Chinese MCP error banner in history (never shown as generic DeepSeek failure)
+  const failedMcpRun = run('1', 'r-timeout', 'failed', 'MCP_TOOL_TIMEOUT');
+  runs.unshift(failedMcpRun);
+  messages.push(message(failedMcpRun, '触发超时'));
+  cleanup();
+
+  // 3) Even when /mcp/summary returns HTTP 500, ordinary chat still loads and displays friendly MCP error
+  overrides.set('/mcp/summary', () => new Response('boom', { status: 500 }));
+  render(<Chat client={client} modelConfigured onOpenMcpPanel={onOpenMcp} />);
+  expect(await screen.findByText(/MCP 工具调用超时，外部执行结果未知/)).toBeTruthy();
+  expect(screen.queryByText('DeepSeek 调用失败。')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: '前往 MCP 服务' }));
+  expect(onOpenMcp).toHaveBeenCalledTimes(2);
 });

@@ -5,7 +5,15 @@ import type { ApiClient, FileGrant, GrantScope } from './api/apiClient';
 type GrantList = { sessionId: string; items: FileGrant[] };
 type Action = { scope: GrantScope } | { grant_id: string };
 
-export default function GrantPanel({ client, sessionId }: { client: ApiClient; sessionId: string }) {
+export default function GrantPanel({
+  client,
+  sessionId,
+  onGrantsChange,
+}: {
+  client: ApiClient;
+  sessionId: string;
+  onGrantsChange?: (sessionId: string, grants: FileGrant[]) => void;
+}) {
   const [list, setList] = useState<GrantList>();
   const [revision, setRevision] = useState(0);
   const [pending, setPending] = useState(false);
@@ -17,7 +25,10 @@ export default function GrantPanel({ client, sessionId }: { client: ApiClient; s
     const controller = new AbortController();
     setLoadError(undefined);
     void client.listGrants(sessionId, controller.signal).then((items) => {
-      if (!controller.signal.aborted) setList({ sessionId, items });
+      if (!controller.signal.aborted) {
+        setList({ sessionId, items });
+        onGrantsChange?.(sessionId, items);
+      }
     }).catch(() => {
       if (!controller.signal.aborted) {
         setList(undefined);
@@ -25,7 +36,7 @@ export default function GrantPanel({ client, sessionId }: { client: ApiClient; s
       }
     });
     return () => controller.abort();
-  }, [client, sessionId, revision]);
+  }, [client, sessionId, revision, onGrantsChange]);
 
   async function changeGrant(action: Action) {
     setPending(true);
@@ -39,9 +50,13 @@ export default function GrantPanel({ client, sessionId }: { client: ApiClient; s
         refresh = grant !== null;
       } else {
         await invoke<void>('revoke_file_grant', { request: { session_id: sessionId, grant_id: action.grant_id } });
-        setList((previous) => previous?.sessionId === sessionId ? {
-          sessionId, items: previous.items.filter((grant) => grant.grant_id !== action.grant_id),
-        } : previous);
+        const nextItems = list?.sessionId === sessionId
+          ? list.items.filter((grant) => grant.grant_id !== action.grant_id)
+          : undefined;
+        setList((previous) => previous?.sessionId === sessionId
+          ? { sessionId, items: previous.items.filter((grant) => grant.grant_id !== action.grant_id) }
+          : previous);
+        if (nextItems) onGrantsChange?.(sessionId, nextItems);
       }
     } catch (error) {
       const message = error === 'GRANT_PATH_REJECTED' ? '无法授权此资源。请选择可访问的 TXT、Markdown 文件或文件夹。'

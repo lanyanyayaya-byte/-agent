@@ -13,6 +13,16 @@ McpErrorCode = Literal[
     "MCP_CONNECT_FAILED",
     "MCP_SERVER_UNAVAILABLE",
     "MCP_SERVER_BUSY",
+    "MCP_ACTIVE_SERVER_LIMIT",
+    "MCP_SERVER_NOT_FOUND",
+    "MCP_TOOL_NOT_FOUND",
+    "MCP_SERVER_NAME_CONFLICT",
+    "MCP_PERMISSION_DENIED",
+    "MCP_UNTRUSTED_SERVER",
+    "MCP_TRUST_STALE",
+    "MCP_CREDENTIALS_MISSING",
+    "MCP_SCHEMA_INCOMPATIBLE",
+    "MCP_DESTRUCTIVE_TOOL_BLOCKED",
     "MCP_TOOL_TIMEOUT",
     "MCP_TOOL_RETURNED_ERROR",
     "MCP_TOOL_CANCELLED",
@@ -31,6 +41,16 @@ MCP_ERROR_MESSAGES: dict[McpErrorCode, str] = {
     "MCP_CONNECT_FAILED": "无法连接到 MCP 服务。",
     "MCP_SERVER_UNAVAILABLE": "MCP 服务当前未连接或不可用。",
     "MCP_SERVER_BUSY": "该 MCP 服务当前请求排队已满，请稍后重试。",
+    "MCP_ACTIVE_SERVER_LIMIT": "同时连接的 MCP 服务数量已达上限。",
+    "MCP_SERVER_NOT_FOUND": "未找到指定的 MCP 服务。",
+    "MCP_TOOL_NOT_FOUND": "未找到指定的 MCP 工具。",
+    "MCP_SERVER_NAME_CONFLICT": "已存在同名的 MCP 服务。",
+    "MCP_PERMISSION_DENIED": "当前操作或工具未获得有效授权。",
+    "MCP_UNTRUSTED_SERVER": "该 MCP 服务尚未完成信任确认，禁止启动或连接。",
+    "MCP_TRUST_STALE": "MCP 服务配置在确认期间已发生变化，请重新核对后再确认。",
+    "MCP_CREDENTIALS_MISSING": "该 MCP 服务缺少必需的钥匙串凭据，无法启动或连接。",
+    "MCP_SCHEMA_INCOMPATIBLE": "该 MCP 工具的参数 Schema 不兼容，无法授权启用。",
+    "MCP_DESTRUCTIVE_TOOL_BLOCKED": "该 MCP 工具声明为破坏性操作，当前版本暂不允许启用。",
     "MCP_TOOL_TIMEOUT": "MCP 工具调用超时，外部执行结果未知。",
     "MCP_TOOL_RETURNED_ERROR": "MCP 工具返回了错误结果。",
     "MCP_TOOL_CANCELLED": "MCP 工具调用已取消。",
@@ -188,6 +208,7 @@ class McpDiagnostics:
     child_pid: int | None = None
     tool_count: int = 0
     catalog_version: int = 0
+    catalog_stale: bool = False
     tools_truncated: bool = False
     last_error_code: McpErrorCode | None = None
     last_error_message: str | None = None

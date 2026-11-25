@@ -79,12 +79,146 @@ export type KnowledgeQueryOptions = {
   top_k?: number;
 };
 
+export type McpRunOptions = {
+  enabled: boolean;
+  allow_external_data_egress: boolean;
+};
+
+export type McpTransportKind = 'stdio' | 'streamable_http';
+export type McpRuntimeState = 'disconnected' | 'connecting' | 'connected' | 'disconnecting' | 'error';
+export type McpTrustState = 'untrusted' | 'trusted';
+export type McpToolPermissionState = 'denied' | 'allowed';
+
+export type McpConfigEntryView =
+  | { kind: 'plain'; value: string }
+  | { kind: 'secret'; secret_key: string; configured: boolean };
+
+export type McpConfigEntryRequest =
+  | { kind: 'plain'; value: string }
+  | { kind: 'secret'; secret_key: string };
+
+export type McpServerRuntime = {
+  state: McpRuntimeState;
+  generation: number;
+  protocol_version: string | null;
+  server_name_reported: string | null;
+  server_version_reported: string | null;
+  tool_count: number;
+  catalog_version: number;
+  catalog_stale: boolean;
+  tools_truncated: boolean;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  stderr_tail: string[];
+  connected_at: string | null;
+};
+
+export type McpServerView = {
+  server_id: string;
+  name: string;
+  transport: McpTransportKind;
+  command: string | null;
+  resolved_command: string | null;
+  executable_exists: boolean | null;
+  args: string[];
+  cwd: string | null;
+  url: string | null;
+  allow_private_network: boolean;
+  private_network_target: boolean;
+  high_risk_command: boolean;
+  high_risk_reasons: string[];
+  env_config: Record<string, McpConfigEntryView>;
+  header_config: Record<string, McpConfigEntryView>;
+  credential_ref: string | null;
+  credentials_complete: boolean;
+  missing_secret_keys: string[];
+  enabled: boolean;
+  trust_state: McpTrustState;
+  trust_valid: boolean;
+  config_revision: number;
+  trusted_revision: number | null;
+  trusted_fingerprint: string | null;
+  current_fingerprint: string;
+  discovered_tool_count: number;
+  allowed_tool_count: number;
+  effective_allowed_tool_count: number;
+  runtime: McpServerRuntime;
+  created_at: string;
+  updated_at: string;
+};
+
+export type McpToolView = {
+  tool_id: string;
+  server_id: string;
+  original_tool_name: string;
+  title: string | null;
+  description: string;
+  input_schema: Record<string, unknown>;
+  annotations: Record<string, unknown>;
+  definition_hash: string;
+  schema_compatible: boolean;
+  incompatibility_reason: string | null;
+  permission_state: McpToolPermissionState;
+  approved_definition_hash: string | null;
+  approved_config_revision: number | null;
+  definition_changed: boolean;
+  is_destructive: boolean;
+  present_in_last_discovery: boolean;
+  effective_allowed: boolean;
+  discovered_at: string;
+  updated_at: string;
+};
+
+export type McpSummary = {
+  total_servers: number;
+  enabled_servers: number;
+  connected_servers: number;
+  error_servers: number;
+  effective_allowed_tools: number;
+  max_tools_per_run: number;
+  exceeds_tool_limit: boolean;
+};
+
+export type SaveMcpServerRequest = {
+  server_id: string | null;
+  name: string;
+  transport: McpTransportKind;
+  command: string | null;
+  args: string[];
+  cwd: string | null;
+  clear_cwd: boolean;
+  url: string | null;
+  allow_private_network: boolean;
+  env_config: Record<string, McpConfigEntryRequest>;
+  header_config: Record<string, McpConfigEntryRequest>;
+  secret_values: Record<string, string>;
+  remove_secret_keys: string[];
+};
+
+export type ImportMcpServersResult = {
+  servers: McpServerView[];
+  warnings: string[];
+};
+
+export type SetMcpToolPermissionRequest = {
+  server_id: string;
+  tool_id: string;
+  permission_state: McpToolPermissionState;
+  expected_definition_hash: string | null;
+  expected_config_revision: number | null;
+};
+
 export type ToolCallSummary = {
   tool_call_id: string;
   tool_name: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   summary: string | null;
   error_code: string | null;
+  source?: 'native' | 'mcp';
+  server_id?: string | null;
+  server_name?: string | null;
+  original_tool_name?: string | null;
+  duration_ms?: number | null;
 };
 
 type BackendConnection = {
@@ -194,6 +328,120 @@ export class ApiRequestError extends Error {
   constructor(message: string, readonly code?: string, readonly runId?: string) {
     super(message);
   }
+}
+
+export function extractErrorCode(error: unknown): string | undefined {
+  if (error instanceof ApiRequestError) return error.code;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') {
+    return error.code;
+  }
+  return undefined;
+}
+
+export function mcpErrorMessage(error: unknown, fallback: string): string {
+  switch (extractErrorCode(error)) {
+    case 'MCP_TRUST_CANCELLED': return '已取消信任确认，服务仍保持未信任状态。';
+    case 'MCP_TRUST_DIALOG_FAILED': return '无法弹出原生信任确认框，请重试或检查桌面窗口状态。';
+    case 'MCP_CREDENTIAL_REJECTED': return '凭据格式无效（不能为空、不能包含换行或空字符，且需与已声明的凭据键对应）。';
+    case 'MCP_CREDENTIAL_REPLAY_FAILED': return '凭据已写入钥匙串，但未能同步到后端内存，请稍后重试连接。';
+    case 'MCP_KEYCHAIN_CLEANUP_FAILED': return '服务配置已删除，但清理 macOS 钥匙串中的凭据失败，请在钥匙串访问中手动确认。';
+    case 'KEYCHAIN_ACCESS_FAILED': return '无法访问 macOS 钥匙串，请检查系统权限后重试。';
+    case 'KEYCHAIN_CREDENTIAL_CORRUPTED': return 'macOS 钥匙串中的 MCP 凭据已损坏，请重新保存凭据。';
+    case 'MCP_INVALID_CONFIG': return 'MCP 服务配置无效，请检查字段格式、URL 或命令行参数（禁止在明文参数/环境变量中夹带密钥）。';
+    case 'MCP_NETWORK_POLICY_VIOLATION': return 'HTTP 目标地址违反安全网络策略（非本地回环必须使用 HTTPS，私网地址需显式允许）。';
+    case 'MCP_EXECUTABLE_NOT_FOUND': return '未找到指定路径的可执行程序，请填写准确的绝对路径或检查本机环境。';
+    case 'MCP_SERVER_NAME_CONFLICT': return '已存在同名的 MCP 服务，请更换服务名称。';
+    case 'MCP_SERVER_NOT_FOUND': return '该 MCP 服务已不存在，请刷新列表。';
+    case 'MCP_TOOL_NOT_FOUND': return '该 MCP 工具已不存在，请刷新工具列表。';
+    case 'MCP_UNTRUSTED_SERVER': return '该 MCP 服务尚未完成信任确认或关键配置已变更，请先通过原生弹窗确认信任。';
+    case 'MCP_TRUST_STALE': return '确认期间服务配置发生了变更，请核对最新配置后重新确认信任。';
+    case 'MCP_CREDENTIALS_MISSING': return '该 MCP 服务缺少必需的钥匙串凭据，请编辑服务并补充凭据后再连接。';
+    case 'MCP_ACTIVE_SERVER_LIMIT': return '同时连接的 MCP 服务数量已达上限（8 个），请先断开其他服务。';
+    case 'MCP_CONNECT_TIMEOUT': return '连接 MCP 服务超时，请检查本地程序是否能正常响应或网络是否可达。';
+    case 'MCP_CONNECT_FAILED': return '无法连接到 MCP 服务，请查看脱敏诊断信息排查原因。';
+    case 'MCP_DISCOVERY_FAILED': return '获取 MCP 工具列表失败，请稍后重试。';
+    case 'MCP_SCHEMA_INCOMPATIBLE': return '该工具的参数 Schema 不兼容，无法授权启用。';
+    case 'MCP_DESTRUCTIVE_TOOL_BLOCKED': return '该工具被标记为破坏性操作，当前版本不允许授权启用。';
+    case 'MCP_PERMISSION_DENIED': return 'MCP 工具未获得有效授权，或服务配置/工具定义已发生变化。';
+    case 'MCP_SERVER_UNAVAILABLE': return 'MCP 服务当前未启用、未连接或正在刷新工具目录。';
+    case 'MCP_SERVER_BUSY': return '该 MCP 服务当前请求排队已满，请稍后重试。';
+    case 'MCP_TOOL_TIMEOUT': return 'MCP 工具调用超时，外部执行结果未知。';
+    case 'MCP_TOOL_RETURNED_ERROR': return 'MCP 工具返回了错误结果。';
+    case 'MCP_PROTOCOL_ERROR': return 'MCP 协议通信失败或连接中断。';
+    case 'MCP_RESPONSE_TOO_LARGE': return 'MCP 响应体积超过安全上限，已中止读取。';
+    case 'MCP_MALFORMED_RESPONSE': return 'MCP 服务返回了畸形或无法解析的数据。';
+    case 'MCP_CALL_ABORTED': return '同轮前置工具调用已失败，已中止后续外部 MCP 调用。';
+    case 'MCP_TOOL_LIMIT_EXCEEDED': return '当前有效授权工具数量或 Schema 体积超过单轮上限（32 个 / 128 KiB），请前往 MCP 服务页面精简授权工具。';
+    case 'MCP_EGRESS_AUTHORIZATION_REQUIRED': return '当前对话包含受保护的本地文件、教材检索或不可验证的历史上下文，需显式授权本轮数据外发后才能启用 MCP。';
+    case 'RUN_TIMEOUT': return '本轮对话执行总时长已超过上限（300 秒）。';
+    case 'BACKEND_SIDECAR_UNAVAILABLE':
+    case 'BACKEND_SHUTTING_DOWN':
+    case 'SIDECAR_NOT_READY': return '桌面后端暂不可用，请检查连接状态后重试。';
+    default:
+      if (error instanceof ApiRequestError && error.message) return error.message;
+      return fallback;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Privileged MCP Tauri IPC Wrappers (never hold or expose Host Token in WebView)
+// ---------------------------------------------------------------------------
+
+export function mcpSaveServer(request: SaveMcpServerRequest): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_save_server', { request });
+}
+
+export function mcpImportServersJson(rawJson: string): Promise<ImportMcpServersResult> {
+  return invoke<ImportMcpServersResult>('mcp_import_servers_json', {
+    request: { raw_json: rawJson },
+  });
+}
+
+export function mcpTrustServer(serverId: string, enable = false): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_trust_server', {
+    request: { server_id: serverId, enable },
+  });
+}
+
+export function mcpRevokeTrust(serverId: string): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_revoke_trust', {
+    request: { server_id: serverId },
+  });
+}
+
+export function mcpDeleteServer(serverId: string): Promise<void> {
+  return invoke<void>('mcp_delete_server', {
+    request: { server_id: serverId },
+  });
+}
+
+export function mcpConnectServer(serverId: string): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_connect_server', {
+    request: { server_id: serverId },
+  });
+}
+
+export function mcpDisconnectServer(serverId: string): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_disconnect_server', {
+    request: { server_id: serverId },
+  });
+}
+
+export function mcpRefreshTools(serverId: string): Promise<McpToolView[]> {
+  return invoke<McpToolView[]>('mcp_refresh_tools', {
+    request: { server_id: serverId },
+  });
+}
+
+export function mcpSetServerEnabled(serverId: string, enabled: boolean): Promise<McpServerView> {
+  return invoke<McpServerView>('mcp_set_server_enabled', {
+    request: { server_id: serverId, enabled },
+  });
+}
+
+export function mcpSetToolPermission(request: SetMcpToolPermissionRequest): Promise<McpToolView> {
+  return invoke<McpToolView>('mcp_set_tool_permission', { request });
 }
 
 async function requireSuccess(response: Response) {
@@ -367,6 +615,15 @@ export async function connectApiClient() {
     listDocuments(signal: AbortSignal): Promise<DocumentSummary[]> {
       return readJson('/knowledge/documents', signal);
     },
+    listMcpServers(signal: AbortSignal): Promise<McpServerView[]> {
+      return readJson('/mcp/servers', signal);
+    },
+    listMcpServerTools(serverId: string, signal: AbortSignal): Promise<McpToolView[]> {
+      return readJson(`/mcp/servers/${encodeURIComponent(serverId)}/tools`, signal);
+    },
+    getMcpSummary(signal: AbortSignal): Promise<McpSummary> {
+      return readJson('/mcp/summary', signal);
+    },
     getDocument(documentId: string, signal: AbortSignal): Promise<DocumentDetails> {
       return readJson(`/knowledge/documents/${encodeURIComponent(documentId)}`, signal);
     },
@@ -439,6 +696,7 @@ export async function connectApiClient() {
       sessionId: string, clientRequestId: string, message: string,
       signal: AbortSignal, onEvent: (event: RunEvent) => void,
       knowledge?: KnowledgeQueryOptions,
+      mcp?: McpRunOptions,
     ): Promise<void> {
       const response = await request(`/sessions/${encodeURIComponent(sessionId)}/runs/stream`, 'POST', signal, {
         accept: 'text/event-stream',
@@ -446,6 +704,7 @@ export async function connectApiClient() {
           client_request_id: clientRequestId,
           message,
           ...(knowledge ? { knowledge } : {}),
+          ...(mcp ? { mcp } : {}),
         },
       });
       await requireSuccess(response);

@@ -246,5 +246,5 @@ def test_v4_to_v5_migration_preserves_rows(tmp_path):
                    (run_id, session_id, req_id))
         db.execute("INSERT INTO messages VALUES (?, ?, ?, 'user', '问题', 't')", (msg_id, session_id, run_id))
     store = BusinessStore(path)
-    assert rows(path, "PRAGMA user_version") == [(5,)]
+    assert rows(path, "PRAGMA user_version") == [(6,)]
     assert store.list_runs(session_id, 10, None)[0].citations == ()

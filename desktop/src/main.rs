@@ -5,6 +5,8 @@ mod file_picker;
 mod grants;
 mod keychain;
 mod library;
+mod mcp;
+mod mcp_process;
 mod sidecar;
 
 use serde::Serialize;
@@ -87,6 +89,7 @@ fn main() {
         });
     builder
         .manage(file_picker::NativePicker::default())
+        .manage(mcp::NativeTrustPrompt::default())
         .invoke_handler(tauri::generate_handler![
             get_backend_connection,
             save_provider_credential,
@@ -95,7 +98,17 @@ fn main() {
             diagnostics::open_log_directory,
             grants::select_file_grant,
             grants::revoke_file_grant,
-            library::select_and_import_document
+            library::select_and_import_document,
+            mcp::mcp_save_server,
+            mcp::mcp_import_servers_json,
+            mcp::mcp_trust_server,
+            mcp::mcp_revoke_trust,
+            mcp::mcp_delete_server,
+            mcp::mcp_connect_server,
+            mcp::mcp_disconnect_server,
+            mcp::mcp_refresh_tools,
+            mcp::mcp_set_server_enabled,
+            mcp::mcp_set_tool_permission
         ])
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;

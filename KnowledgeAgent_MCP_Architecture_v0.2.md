@@ -5,7 +5,7 @@
 > **项目**：KnowledgeAgent（macOS Apple Silicon，本地优先 AI 桌面助手）  
 > **产品长期方向**：通用桌面 Agent + 专业教材知识库（RAG 当前已满足使用需求，本阶段暂停 RAG 功能扩展）  
 > **开发阶段**：P6 — MCP（Model Context Protocol）能力扩展  
-> **审查基线**：基于 `/Users/lanyan/Documents/项目/agent_1` 实际源码只读审查完成；**未修改业务代码、未安装或升级依赖、未修改数据库、未启动外部 MCP 服务**。凡需依赖安装、运行态实测或打包验证的结论，均在文中明确标注为「待验证（Unverified）」。
+> **审查基线**：基于 `<PROJECT_ROOT>` 实际源码只读审查完成；**未修改业务代码、未安装或升级依赖、未修改数据库、未启动外部 MCP 服务**。凡需依赖安装、运行态实测或打包验证的结论，均在文中明确标注为「待验证（Unverified）」。
 
 ---
 
@@ -907,3 +907,10 @@ ALTER TABLE tool_calls ADD COLUMN duration_ms INTEGER CHECK (duration_ms IS NULL
 7. **防敏感数据外发不唯依赖系统提示词**：P6.4 必须从代码层明确 MCP 参数的数据外发边界，禁止自动向 MCP 传递完整聊天历史、教材正文或本地文件正文。
 8. **本轮 MCP 开关采用显式启用语义（修订 §8.1 / §12.3）**：P6.4/P6.5 实施时，请求体未传 `mcp` 字段的旧客户端默认**不启用 MCP**（`enabled=False`），前端显式传 `mcp: { enabled: true }` 时才启用。
 9. **预算参数允许依据实测微调并留痕**：15s 连接超时、60s 工具超时、2 MiB 传输上限、2.5s 关闭预算均为初始基准；若实测需要调整须记录原因，绝不静默取消安全限制。
+
+### 18.1 P6.4 实施补充决策记录（2026-11-25）
+
+1. **模型工具别名彻底与 `server.name` 解耦**：`backend/app/mcp/adapter.py` 采用 `mcp__<slug(server_id)>_<sha256(server_id)[:10]>__<tool_key>` 生成确定性别名，严格满足 DeepSeek `^[A-Za-z0-9_-]{1,128}$` 约束；修改 Server 显示名称不再影响模型别名与内部工具身份。
+2. **受保护本地上下文外发默认拒绝与显式授权契约（修订 §8.1 `StartRun.mcp`）**：`StartRun.mcp` 定义为 `{ enabled: bool = False, allow_external_data_egress: bool = False }`。当本轮存在已授权外部 MCP 工具且同时启用了教材 RAG（`knowledge.enabled=True`）或会话存在原生文件授权时，若未显式传入 `allow_external_data_egress=True`，在 Run 准入前即拒绝并返回 `403 MCP_EGRESS_AUTHORIZATION_REQUIRED`（不创建 `running` Run，不破坏幂等冲突优先级）。
+3. **凭据值轮换撤销工具授权**：`PUT /api/v1/_host/mcp/servers/{id}/credentials` 在 `mode="update"` 且实际秘钥值发生变化时，除断开活跃连接外同步撤销该服务全部工具授权（防账号/权限范围变更但工具定义未变时的权限继承）；普通启动回灌（`mode="restore"`）与同值重复保存不撤销授权；SQLite 不写入明文或秘钥摘要。
+4. **四点运行态授权校验**：`McpService` 作为 Agent 唯一运行态授权与调用入口，在入队前、`_ServerActor` 出队实际发包前（`before_dispatch`）、结果返回后线性化点以及提交下一次模型推理 / `RemoteProtocolError` 重试前四处均执行完整权限/代际/哈希复核。

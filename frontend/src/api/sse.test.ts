@@ -43,3 +43,103 @@ test('reassembles UTF-8, CRLF, comments and consecutive JSON frames across arbit
     debug.mockRestore();
   }
 });
+
+test('parses incremental MCP tool event metadata while preserving native tool events', () => {
+  const base = { version: 1, session_id: 's1', run_id: 'r1', ts: '2026-11-25T08:00:00Z' };
+
+  const nativeStart = parseRunEvent({
+    ...base,
+    type: 'tool_started',
+    data: { tool_call_id: 'c-native', tool_name: 'read_text' },
+  });
+  expect(nativeStart).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'tool_started',
+    data: { tool_call_id: 'c-native', tool_name: 'read_text' },
+  });
+
+  const mcpStart = parseRunEvent({
+    ...base,
+    type: 'tool_started',
+    data: {
+      tool_call_id: 'c-mcp',
+      tool_name: 'mcp__srv_1__echo_text',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'echo_text',
+    },
+  });
+  expect(mcpStart).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'tool_started',
+    data: {
+      tool_call_id: 'c-mcp',
+      tool_name: 'mcp__srv_1__echo_text',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'echo_text',
+    },
+  });
+
+  const mcpDone = parseRunEvent({
+    ...base,
+    type: 'tool_completed',
+    data: {
+      tool_call_id: 'c-mcp',
+      summary: 'MCP 工具返回 128 字符。',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'echo_text',
+      duration_ms: 842,
+    },
+  });
+  expect(mcpDone).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'tool_completed',
+    data: {
+      tool_call_id: 'c-mcp',
+      summary: 'MCP 工具返回 128 字符。',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'echo_text',
+      duration_ms: 842,
+    },
+  });
+
+  const mcpFail = parseRunEvent({
+    ...base,
+    type: 'tool_failed',
+    data: {
+      tool_call_id: 'c-mcp-2',
+      code: 'MCP_TOOL_TIMEOUT',
+      message: 'MCP 工具调用超时。',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'slow_tool',
+      duration_ms: 60012,
+    },
+  });
+  expect(mcpFail).toEqual({
+    session_id: 's1',
+    run_id: 'r1',
+    type: 'tool_failed',
+    data: {
+      tool_call_id: 'c-mcp-2',
+      code: 'MCP_TOOL_TIMEOUT',
+      message: 'MCP 工具调用超时。',
+      source: 'mcp',
+      server_id: 'srv-1',
+      server_name: 'Local Stdio',
+      original_tool_name: 'slow_tool',
+      duration_ms: 60012,
+    },
+  });
+});

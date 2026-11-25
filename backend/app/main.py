@@ -22,7 +22,10 @@ from app.api.grants import grant_router
 from app.api.index_jobs import index_job_router, index_management_router
 from app.api.knowledge_search import knowledge_search_router
 from app.api.library import library_router
+from app.api.mcp import mcp_router
 from app.diagnostics import record
+from app.mcp.manager import McpManager
+from app.mcp.process_registry import McpProcessRegistry
 from app.models import ModelError
 from app.models.deepseek import DEEPSEEK_BASE_URL
 from app.models.siliconflow import EMBEDDING_MODEL, MAX_BATCH_SIZE, SiliconFlowEmbedding
@@ -33,6 +36,7 @@ from app.services.hybrid_retrieval import HybridRetrievalService
 from app.services.index_worker import IndexWorker
 from app.services.keyword_search import KeywordSearchService
 from app.services.knowledge_qa import KnowledgeQAService
+from app.services.mcp import McpService
 from app.services.vector_retrieval import VectorRetrievalService
 from app.services.grants import GrantRegistry
 from app.services.library import LibraryService, log_maintenance_failure
@@ -43,6 +47,7 @@ from app.storage.checkpoints import CHECKPOINT_DATABASE_NAME
 from app.storage.chunks import ChunkStore
 from app.storage.index_jobs import IndexJobStore
 from app.storage.library import KnowledgeStore, KnowledgeStoreError
+from app.storage.mcp import McpStore
 from app.storage.parsed_documents import ParsedDocumentStore
 
 DEV_ORIGIN = "http://127.0.0.1:1420"
@@ -173,9 +178,19 @@ def create_app(
             library = None
             cleanup = None
             worker_task = None
+            mcp_service = None
             stop_background = control.stopping if control else asyncio.Event()
+            instance_id = control.instance_id if control else uuid4()
+            mcp_store = McpStore(store)
+            mcp_registry = McpProcessRegistry(database_path.parent, str(instance_id))
+            mcp_manager = McpManager(process_registry=mcp_registry)
+            mcp_service = McpService(mcp_store, mcp_manager)
+            await mcp_service.load_persisted_servers()
+            application.state.mcp_store = mcp_store
+            application.state.mcp_manager = mcp_manager
+            application.state.mcp_service = mcp_service
+            runs.mcp_service = mcp_service
             try:
-                instance_id = control.instance_id if control else uuid4()
                 knowledge_store = await asyncio.to_thread(KnowledgeStore, database_path.parent)
                 library = await asyncio.to_thread(LibraryService, knowledge_store, instance_id)
                 try:
@@ -219,6 +234,12 @@ def create_app(
                 yield
             finally:
                 stop_background.set()
+                runs.mcp_service = None
+                if mcp_service is not None:
+                    await mcp_service.shutdown()
+                application.state.mcp_store = None
+                application.state.mcp_manager = None
+                application.state.mcp_service = None
                 if worker_task is not None:
                     await worker_task
                 runs.knowledge_qa = None
@@ -251,6 +272,10 @@ def create_app(
     app.state.hybrid_retrieval = None
     app.state.citation_resolver = None
     app.state.knowledge_qa = None
+    app.state.mcp_store = None
+    app.state.mcp_manager = None
+    app.state.mcp_service = None
+    app.state.runs = runs
 
     @app.exception_handler(ApiError)
     async def handle_api_error(request: Request, error: ApiError) -> JSONResponse:
@@ -319,7 +344,7 @@ def create_app(
                         ids[key] = str(UUID(value))
             record(
                 "http_request", request_id=request.state.request_id, route=route,
-                method=request.method if request.method in {"GET", "POST", "PUT", "DELETE", "OPTIONS"} else "OTHER",
+                method=request.method if request.method in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} else "OTHER",
                 status=response.status_code, elapsed_ms=round((monotonic() - started) * 1000),
                 instance_id=str(control.instance_id) if control else None,
                 error_code=getattr(request.state, "error_code", None),
@@ -341,6 +366,7 @@ def create_app(
     app.include_router(knowledge_search_router(require_ui, require_ready))
     app.include_router(index_job_router(HOST_NAMESPACE, require_ready))
     app.include_router(index_management_router(require_ui, require_ready))
+    app.include_router(mcp_router(HOST_NAMESPACE, require_ui, require_ready))
 
     @app.get("/api/v1/status", dependencies=[Depends(require_ui)])
     async def status(response: Response) -> Status:

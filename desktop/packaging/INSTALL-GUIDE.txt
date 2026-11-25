@@ -1,16 +1,18 @@
-KnowledgeAgent macOS 安装引导（P8.2 测试安装包）
+KnowledgeAgent macOS 安装引导（v0.3.0 个人安装版）
 ================================================
 
-一、安装步骤
-1. 在当前挂载的磁盘映像（DMG）窗口中，将「KnowledgeAgent.app」拖入右侧的「Applications」（应用程序）文件夹。
-2. 打开 Finder →「应用程序」（Applications），双击「KnowledgeAgent」即可启动。
-3. 启动后可在 Dock 栏右键点击「KnowledgeAgent」→「选项」→「在程序坞中保留」，固定到 Dock。
-4. 确认应用正常启动后，可在 Finder 中推出（卸载）本 DMG 磁盘映像。
+一、安装与升级步骤
+1. 若本机已有旧版 KnowledgeAgent，请先完全退出旧版（Cmd+Q），建议备份数据目录：
+   ~/Library/Application Support/local.knowledgeagent.desktop
+2. 在当前挂载的磁盘映像（DMG）窗口中，将「KnowledgeAgent.app」拖入右侧的「Applications」（应用程序）文件夹（升级时选择替换）。
+3. 打开 Finder →「应用程序」（Applications），双击「KnowledgeAgent」即可启动。
+4. 启动后可在 Dock 栏右键点击「KnowledgeAgent」→「选项」→「在程序坞中保留」，固定到 Dock。
+5. 确认应用正常启动后，可在 Finder 中推出（卸载）本 DMG 磁盘映像。
 
-二、运行环境说明
-- 本应用已内置完整的 Python 3.12 运行时与后端 Sidecar 组件。
-- 用户无需安装 Python、Node.js、Rust 或使用终端命令行。
+二、运行环境与外部 MCP 工具说明
+- 本应用已内置完整的 Python 3.12 运行时、MCP SDK 与后端 Sidecar 组件。
+- 远程 Streamable HTTP MCP 服务（如 Exa、Context7、DeepWiki）开箱即用，无需本地安装。
+- 本地 stdio MCP 工具（如 mcp-server-fetch、arxiv-mcp-server）属于本机独立安装的外部程序，不随本安装包分发；本机已通过 uv tool install 安装过的工具可直接复用，无需重装。
 
-三、签名与测试包声明
-- 本安装包为 P8.2 阶段的本地测试安装包，当前使用 macOS Ad-hoc 签名（signingIdentity: "-"）。
-- 本测试安装包尚未执行 P8.3 的 Apple Developer ID 正式签名与 Apple Notary 公证，不得视为已通过 Gatekeeper 正式公证发行验收。
+三、签名声明
+- 本安装包为 Apple Silicon macOS 本地自用安装版，使用 macOS Ad-hoc 签名（signingIdentity: "-"），未执行商业 Developer ID 签名与 Apple Notary 公证。

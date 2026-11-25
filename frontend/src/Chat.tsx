@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import {
   ApiRequestError,
   isTerminal,
+  mcpErrorMessage,
   type ApiClient,
   type CoverageMode,
   type DocumentSummary,
+  type FileGrant,
+  type McpSummary,
   type Message,
   type RetrievalMode,
   type RunState,
@@ -13,13 +16,14 @@ import {
   type StoredCitation,
   type ToolCallSummary,
 } from './api/apiClient';
-import type { RunEvent } from './api/chatEvents';
+import type { RunEvent, ToolSource } from './api/chatEvents';
 import GrantPanel from './GrantPanel';
 import MarkdownAnswer from './MarkdownAnswer';
 
 const MESSAGE_LIMIT = 20_000;
 const POLL_INTERVAL_MS = 1000;
 const SELECTED_SESSION_KEY = 'knowledgeagent.selected_session';
+const MCP_ENABLED_STORAGE_KEY = 'knowledgeagent.mcp_enabled';
 const DEFAULT_SESSION_TITLE = /^(?:新对话|会话\s*\d+)$/;
 const TITLE_FILLER_PREFIX =
   /^(?:你好(?:呀|啊)?[，,！!。.\s]*|请问一下|请问|请教一下|请教|请帮我|帮我|给我|能否|可以|麻烦|详细讲解一下|深入讲解一下|讲解一下|详细讲解|讲解|讲讲|讲一下|谈谈|说说|详细解释一下|解释一下|请解释|总结一下|请总结|介绍一下|请介绍|分析一下|推导一下|证明一下|梳理一下|对比不同教材中(?:关于)?|不同教材中(?:关于)?|告诉我|什么是|如何理解|怎么理解|关于)+\s*/;
@@ -41,8 +45,30 @@ export function deriveSessionTitle(question: string): string {
 }
 
 type Turn = { user: Message; run?: RunSummary; assistant?: Message };
-type ToolProgress = { id: string; name: string; state: 'running' | 'completed' | 'failed' | 'cancelled'; summary?: string };
+type ToolProgress = {
+  id: string;
+  name: string;
+  state: 'running' | 'completed' | 'failed' | 'cancelled';
+  summary?: string;
+  errorCode?: string;
+  source?: ToolSource;
+  serverId?: string;
+  serverName?: string;
+  originalToolName?: string;
+  durationMs?: number;
+};
 type ToolEvent = Extract<RunEvent, { type: 'tool_started' | 'tool_completed' | 'tool_failed' }>;
+
+type EgressPrompt = {
+  sessionId: string;
+  question: string;
+  currentRagRisk: boolean;
+  currentFileGrantRisk: boolean;
+  historicalRagRisk: boolean;
+  historicalFileRisk: boolean;
+  backendMessage?: string;
+  backendForcedHistoryRisk?: boolean;
+};
 
 type LiveTurn = {
   requestId: string;
@@ -64,6 +90,7 @@ type Conversation = Pick<SessionSummary, 'session_id' | 'title'> & {
   citationsByRun?: Record<string, StoredCitation[]>;
   live?: LiveTurn;
   submittingError?: string;
+  submittingErrorCode?: string;
   version: number;
   loadedVersion?: number;
 };
@@ -77,39 +104,151 @@ const statusLabels: Record<RunState, string> = {
   cancelled: '已取消',
 };
 
+const MCP_MANAGEABLE_ERROR_CODES = new Set([
+  'MCP_SERVER_UNAVAILABLE',
+  'MCP_PERMISSION_DENIED',
+  'MCP_TOOL_TIMEOUT',
+  'MCP_TOOL_RETURNED_ERROR',
+  'MCP_PROTOCOL_ERROR',
+  'MCP_RESPONSE_TOO_LARGE',
+  'MCP_MALFORMED_RESPONSE',
+  'MCP_SERVER_BUSY',
+  'MCP_CALL_ABORTED',
+  'MCP_TOOL_LIMIT_EXCEEDED',
+]);
+
+function isMcpManageableError(code?: string | null): boolean {
+  return Boolean(code && MCP_MANAGEABLE_ERROR_CODES.has(code));
+}
+
 function failureMessage(code: string | null) {
   switch (code) {
     case 'MODEL_TIMEOUT': return 'DeepSeek 响应超时。';
     case 'MODEL_UPSTREAM_ERROR': return 'DeepSeek 调用失败。';
     case 'RUN_INTERRUPTED': return '后端运行已中断，本次生成已结束。';
     case 'RATE_LIMITED': return '本轮工具调用次数或返回内容已达到上限。';
+    case 'RUN_TIMEOUT': return '本轮对话执行总时长已超过上限（300 秒）。';
+    case 'MCP_SERVER_UNAVAILABLE': return 'MCP 服务当前未连接或不可用，请检查 MCP 服务连接状态。';
+    case 'MCP_PERMISSION_DENIED': return 'MCP 工具未获得有效授权，或服务配置/工具定义已变更，请在 MCP 服务页重新核对授权。';
+    case 'MCP_TOOL_TIMEOUT': return 'MCP 工具调用超时，外部执行结果未知。';
+    case 'MCP_TOOL_RETURNED_ERROR': return 'MCP 工具返回了错误结果。';
+    case 'MCP_PROTOCOL_ERROR': return 'MCP 协议通信失败或连接中断，请检查服务诊断信息。';
+    case 'MCP_RESPONSE_TOO_LARGE': return 'MCP 响应体积超过安全上限，已中止读取。';
+    case 'MCP_MALFORMED_RESPONSE': return 'MCP 服务返回了畸形或无法解析的数据。';
+    case 'MCP_SERVER_BUSY': return '该 MCP 服务当前请求排队已满，请稍后重试。';
+    case 'MCP_CALL_ABORTED': return '同轮前置工具调用已失败，已中止后续外部 MCP 调用。';
+    case 'MCP_TOOL_LIMIT_EXCEEDED': return '本轮授权工具数量或 Schema 大小超出上限，请前往 MCP 服务页精简授权。';
+    case 'MCP_EGRESS_AUTHORIZATION_REQUIRED': return '当前对话包含受保护的本地上下文，需先完成本轮外部数据外发确认。';
     default: return '无法完成本次生成。';
   }
+}
+
+function formatDuration(durationMs?: number): string | undefined {
+  if (typeof durationMs !== 'number' || Number.isNaN(durationMs) || durationMs < 0) return undefined;
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function readInitialMcpEnabled(): boolean {
+  try {
+    return localStorage.getItem(MCP_ENABLED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function inspectHistoricalContextRisk(turns?: Turn[]) {
+  let historicalRagRisk = false;
+  let historicalFileRisk = false;
+  if (!turns?.length) return { historicalRagRisk, historicalFileRisk };
+  for (const turn of turns) {
+    const run = turn.run;
+    if (!run || run.status !== 'completed') continue;
+    if (run.citations && run.citations.length > 0) {
+      historicalRagRisk = true;
+    }
+    if (run.tool_calls) {
+      for (const tc of run.tool_calls) {
+        if (tc.tool_name === 'search_knowledge') {
+          historicalRagRisk = true;
+        } else if ((tc.source ?? 'native') !== 'mcp') {
+          historicalFileRisk = true;
+        }
+      }
+    }
+  }
+  return { historicalRagRisk, historicalFileRisk };
 }
 
 function toolProgress(previous: ToolProgress[], event: ToolEvent): ToolProgress[] {
   const id = event.data.tool_call_id;
   if (event.type === 'tool_started') {
     if (previous.some((tool) => tool.id === id)) return previous;
-    return [...previous, { id, name: event.data.tool_name, state: 'running' }];
+    return [
+      ...previous,
+      {
+        id,
+        name: event.data.tool_name,
+        state: 'running',
+        source: event.data.source,
+        serverId: event.data.server_id ?? undefined,
+        serverName: event.data.server_name ?? undefined,
+        originalToolName: event.data.original_tool_name ?? undefined,
+      },
+    ];
   }
   const summary = event.type === 'tool_completed' ? event.data.summary : event.data.message;
   const state = event.type === 'tool_completed' ? 'completed' : event.data.code === 'RUN_CANCELLED' ? 'cancelled' : 'failed';
-  return previous.map((tool) => tool.id === id && tool.state === 'running' ? { ...tool, state, summary } : tool);
+  const errorCode = event.type === 'tool_failed' ? event.data.code : undefined;
+  return previous.map((tool) => {
+    if (tool.id !== id || tool.state !== 'running') return tool;
+    return {
+      ...tool,
+      state,
+      summary,
+      errorCode,
+      source: event.data.source ?? tool.source,
+      serverId: event.data.server_id ?? tool.serverId,
+      serverName: event.data.server_name ?? tool.serverName,
+      originalToolName: event.data.original_tool_name ?? tool.originalToolName,
+      durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : tool.durationMs,
+    };
+  });
 }
 
 function ToolActivity({ tools, status }: { tools?: ToolProgress[]; status?: RunState }) {
   if (!tools?.length) return null;
   return (
     <ul className="tool-activity" aria-label="工具执行">
-      {tools.map((tool) => (
-        <li key={tool.id} role="status" data-state={tool.state}>
-          <span className="tool-name">{tool.name}</span>{' · '}
-          {tool.state === 'running' ? (status && isTerminal(status) ? '执行已中断' : '执行中')
-            : { completed: '已完成', failed: '执行失败', cancelled: '已取消' }[tool.state]}
-          {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
-        </li>
-      ))}
+      {tools.map((tool) => {
+        const stateText = tool.state === 'running'
+          ? (status && isTerminal(status) ? '执行已中断' : '执行中')
+          : { completed: '已完成', failed: '执行失败', cancelled: '已取消' }[tool.state];
+        if (tool.source === 'mcp') {
+          const duration = formatDuration(tool.durationMs);
+          return (
+            <li key={tool.id} role="status" className="tool-activity-mcp" data-state={tool.state} data-source="mcp">
+              <span className="tool-source-badge">MCP</span>
+              {tool.serverName && <span className="tool-server-name">{tool.serverName}</span>}
+              <span className="tool-name">{tool.originalToolName || tool.name}</span>
+              {' · '}
+              <span className={`tool-state-label state-${tool.state}`}>{stateText}</span>
+              {duration && <span className="tool-duration"> · {duration}</span>}
+              {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
+              {tool.state === 'failed' && tool.errorCode && (
+                <code className="tool-error-code">{tool.errorCode}</code>
+              )}
+            </li>
+          );
+        }
+        return (
+          <li key={tool.id} role="status" data-state={tool.state}>
+            <span className="tool-name">{tool.name}</span>{' · '}
+            {stateText}
+            {tool.summary && <span className="tool-summary"> · {tool.summary}</span>}
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -122,6 +261,12 @@ function resolveTurnTools(liveTools?: ToolProgress[], savedTools?: ToolCallSumma
     name: tc.tool_name,
     state: tc.status,
     summary: tc.summary ?? undefined,
+    errorCode: tc.error_code ?? undefined,
+    source: tc.source,
+    serverId: tc.server_id ?? undefined,
+    serverName: tc.server_name ?? undefined,
+    originalToolName: tc.original_tool_name ?? undefined,
+    durationMs: typeof tc.duration_ms === 'number' ? tc.duration_ms : undefined,
   }));
 }
 
@@ -255,12 +400,16 @@ export default function Chat({
   preview = false,
   defaultRagEnabled = false,
   autoTitleSessions = false,
+  mcpSummary,
+  onOpenMcpPanel,
 }: {
   client?: ApiClient;
   modelConfigured: boolean;
   preview?: boolean;
   defaultRagEnabled?: boolean;
   autoTitleSessions?: boolean;
+  mcpSummary?: McpSummary | null;
+  onOpenMcpPanel?: () => void;
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<string>();
@@ -283,10 +432,29 @@ export default function Chat({
   const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
   const [textbooks, setTextbooks] = useState<DocumentSummary[]>([]);
   const [textbooksLoading, setTextbooksLoading] = useState(false);
+  const [mcpEnabled, setMcpEnabled] = useState<boolean>(readInitialMcpEnabled);
+  const [localMcpSummary, setLocalMcpSummary] = useState<McpSummary>();
+  const [grantsBySession, setGrantsBySession] = useState<Record<string, FileGrant[]>>({});
+  const [egressPrompt, setEgressPrompt] = useState<EgressPrompt>();
   const [grantsOpen, setGrantsOpen] = useState(false);
   const [scopeOpen, setScopeOpen] = useState(false);
   const turnsEndRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+
+  const effectiveMcpSummary = mcpSummary === undefined ? localMcpSummary : (mcpSummary ?? undefined);
+
+  const handleGrantsChange = useCallback((sid: string, grants: FileGrant[]) => {
+    setGrantsBySession((prev) => ({ ...prev, [sid]: grants }));
+  }, []);
+
+  function toggleMcpEnabled(next: boolean) {
+    setMcpEnabled(next);
+    try {
+      localStorage.setItem(MCP_ENABLED_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage quota/access errors.
+    }
+  }
 
   const active = listReady ? conversations.find((session) => session.session_id === selected) : undefined;
   const sessionId = active?.session_id;
@@ -321,6 +489,21 @@ export default function Chat({
       setStopping(undefined);
     };
   }, [client]);
+
+  useEffect(() => {
+    if (!client || mcpSummary !== undefined) return;
+    const controller = new AbortController();
+    void client.getMcpSummary(controller.signal).then((summary) => {
+      if (!controller.signal.aborted) setLocalMcpSummary(summary);
+    }).catch(() => {
+      // Never impact ordinary chat if MCP summary endpoint is unavailable.
+    });
+    return () => controller.abort();
+  }, [client, mcpSummary, mcpEnabled]);
+
+  useEffect(() => {
+    setEgressPrompt(undefined);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!client || !ragEnabled || !sessionId) return;
@@ -429,7 +612,7 @@ export default function Chat({
     }));
   }
 
-  async function createSession() {
+  async function createSession(initialInput = '') {
     if (!client || creating) return;
     const controller = new AbortController();
     requests.current.add(controller);
@@ -439,7 +622,7 @@ export default function Chat({
       const initialTitle = autoTitleSessions ? '新对话' : `会话 ${conversations.length + 1}`;
       const session = await client.createSession(initialTitle, controller.signal);
       if (controller.signal.aborted) return;
-      setConversations((previous) => [{ ...session, input: '', version: 0 }, ...previous]);
+      setConversations((previous) => [{ ...session, input: initialInput, version: 0 }, ...previous]);
       selectSession(session.session_id);
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -550,17 +733,18 @@ export default function Chat({
     }
   }
 
-  async function send(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!client || !active || !modelConfigured || busy || !loaded || tooLong) return;
-    const { session_id: id } = active;
-    const question = active.input.trim();
-    if (!question) return;
-
+  async function executeSend(
+    targetSession: Conversation,
+    question: string,
+    { allowExternalDataEgress, forceMcpEnabled }: { allowExternalDataEgress: boolean; forceMcpEnabled?: boolean },
+  ) {
+    if (!client || !modelConfigured) return;
+    const id = targetSession.session_id;
+    const useMcp = forceMcpEnabled ?? mcpEnabled;
     const requestId = crypto.randomUUID();
     const controller = new AbortController();
     requests.current.add(controller);
-    const shouldAutoTitle = autoTitleSessions && DEFAULT_SESSION_TITLE.test(active.title);
+    const shouldAutoTitle = autoTitleSessions && DEFAULT_SESSION_TITLE.test(targetSession.title);
     const nextAutoTitle = shouldAutoTitle ? deriveSessionTitle(question) : undefined;
     updateSession(id, (session) => ({
       ...session,
@@ -568,8 +752,9 @@ export default function Chat({
       input: '',
       live: { requestId, question, draft: '' },
       submittingError: undefined,
+      submittingErrorCode: undefined,
     }));
-    if (nextAutoTitle && nextAutoTitle !== active.title) {
+    if (nextAutoTitle && nextAutoTitle !== targetSession.title) {
       const titleController = new AbortController();
       requests.current.add(titleController);
       void client.renameSession(id, nextAutoTitle, titleController.signal)
@@ -590,6 +775,10 @@ export default function Chat({
       coverage_mode: ragCoverage,
       top_k: 6,
     } : undefined;
+    const mcpOptions = {
+      enabled: useMcp,
+      allow_external_data_egress: useMcp ? allowExternalDataEgress : false,
+    };
     try {
       await client.streamRun(id, requestId, question, controller.signal, (item) => {
         if (controller.signal.aborted) return;
@@ -610,7 +799,10 @@ export default function Chat({
               return session;
             }
             const items = toolProgress(session.toolsByRun?.[item.run_id] ?? [], item);
-            return { ...session, toolsByRun: { ...session.toolsByRun, [item.run_id]: items } };
+            const nextLive = item.type === 'tool_started' && session.live.draft
+              ? { ...session.live, draft: '' }
+              : session.live;
+            return { ...session, live: nextLive, toolsByRun: { ...session.toolsByRun, [item.run_id]: items } };
           });
         } else if (item.type === 'run_citations') {
           updateSession(id, (session) => {
@@ -625,13 +817,33 @@ export default function Chat({
         } else {
           settle(id, item.run_id);
         }
-      }, knowledgeOptions);
+      }, knowledgeOptions, mcpOptions);
     } catch (error) {
       if (controller.signal.aborted) return;
       if (error instanceof ApiRequestError && !['DUPLICATE_CLIENT_REQUEST', 'RUN_ALREADY_ACTIVE'].includes(error.code ?? '')) {
+        const displayMsg = error.code ? mcpErrorMessage(error, error.message) : error.message;
         updateSession(id, (session) => ({
-          ...session, live: undefined, input: session.input || question, submittingError: error.message,
+          ...session,
+          live: undefined,
+          input: session.input || question,
+          submittingError: displayMsg,
+          submittingErrorCode: error.code,
         }));
+        if (error.code === 'MCP_EGRESS_AUTHORIZATION_REQUIRED') {
+          const hist = inspectHistoricalContextRisk(targetSession.turns);
+          const activeGrants = grantsBySession[id] ?? [];
+          const hasLocalCurrent = ragEnabled || activeGrants.length > 0;
+          setEgressPrompt({
+            sessionId: id,
+            question,
+            currentRagRisk: ragEnabled,
+            currentFileGrantRisk: activeGrants.length > 0,
+            historicalRagRisk: hist.historicalRagRisk,
+            historicalFileRisk: hist.historicalFileRisk,
+            backendMessage: error.message,
+            backendForcedHistoryRisk: !hasLocalCurrent || hist.historicalRagRisk || hist.historicalFileRisk,
+          });
+        }
         return;
       }
       updateSession(id, (session) => session.live?.requestId !== requestId ? session : {
@@ -639,7 +851,9 @@ export default function Chat({
       });
       try {
         if (error instanceof ApiRequestError && error.code === 'RUN_ALREADY_ACTIVE') {
-          updateSession(id, (session) => ({ ...session, live: undefined, submittingError: error.message }));
+          updateSession(id, (session) => ({
+            ...session, live: undefined, submittingError: error.message, submittingErrorCode: error.code,
+          }));
           reloadHistory(id);
           return;
         }
@@ -654,13 +868,13 @@ export default function Chat({
         if (controller.signal.aborted) return;
         if (runId) {
           updateSession(id, (session) => ({
-            ...session, submittingError: '暂时无法确认运行状态。',
+            ...session, submittingError: '暂时无法确认运行状态。', submittingErrorCode: undefined,
             live: session.live && { ...session.live, lookupComplete: true },
           }));
         } else {
           updateSession(id, (session) => ({
             ...session, live: undefined, input: session.input || question,
-            submittingError: '连接中断，暂时无法确认请求是否已提交。',
+            submittingError: '连接中断，暂时无法确认请求是否已提交。', submittingErrorCode: undefined,
           }));
           reloadHistory(id);
         }
@@ -668,6 +882,34 @@ export default function Chat({
     } finally {
       requests.current.delete(controller);
     }
+  }
+
+  async function send(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!client || !active || !modelConfigured || busy || !loaded || tooLong) return;
+    const question = active.input.trim();
+    if (!question) return;
+
+    const hasAvailableMcpTools = effectiveMcpSummary === undefined || effectiveMcpSummary.effective_allowed_tools > 0;
+    if (mcpEnabled && hasAvailableMcpTools) {
+      const activeGrants = grantsBySession[active.session_id] ?? [];
+      const currentRagRisk = ragEnabled;
+      const currentFileGrantRisk = activeGrants.length > 0;
+      const { historicalRagRisk, historicalFileRisk } = inspectHistoricalContextRisk(active.turns);
+      if (currentRagRisk || currentFileGrantRisk || historicalRagRisk || historicalFileRisk) {
+        setEgressPrompt({
+          sessionId: active.session_id,
+          question,
+          currentRagRisk,
+          currentFileGrantRisk,
+          historicalRagRisk,
+          historicalFileRisk,
+        });
+        return;
+      }
+    }
+
+    await executeSend(active, question, { allowExternalDataEgress: false });
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -875,7 +1117,7 @@ export default function Chat({
             </header>
 
             <div className={`context-drawer ${grantsOpen ? 'is-open' : 'is-closed'}`}>
-              <GrantPanel client={client} sessionId={active.session_id} />
+              <GrantPanel client={client} sessionId={active.session_id} onGrantsChange={handleGrantsChange} />
             </div>
 
             {ragEnabled && (
@@ -983,7 +1225,14 @@ export default function Chat({
                           )}
                           {status === 'failed' && run && (
                             <p role="alert" className="turn-error-banner">
-                              {failureMessage(run.error_code)} {run.error_code && <code>{run.error_code}</code>}
+                              <span>
+                                {failureMessage(run.error_code)} {run.error_code && <code>{run.error_code}</code>}
+                              </span>
+                              {onOpenMcpPanel && isMcpManageableError(run.error_code) && (
+                                <button type="button" className="inline-jump-btn" onClick={onOpenMcpPanel}>
+                                  前往 MCP 服务
+                                </button>
+                              )}
                             </p>
                           )}
                           {user.run_id === live?.runId && showDraft && (
@@ -1035,6 +1284,130 @@ export default function Chat({
             </div>
 
             <div className="composer-dock">
+              {mcpEnabled && effectiveMcpSummary?.exceeds_tool_limit && (
+                <div role="alert" className="composer-mcp-warning">
+                  <span>
+                    当前有效授权 MCP 工具数（{effectiveMcpSummary.effective_allowed_tools}）超过单轮上限（{effectiveMcpSummary.max_tools_per_run}），发送前请减少授权工具。
+                  </span>
+                  {onOpenMcpPanel && (
+                    <button type="button" className="inline-jump-btn" onClick={onOpenMcpPanel}>
+                      管理 MCP 工具
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {egressPrompt && egressPrompt.sessionId === active.session_id && (() => {
+                const hasHistoricalRisk = egressPrompt.historicalRagRisk
+                  || egressPrompt.historicalFileRisk
+                  || Boolean(egressPrompt.backendForcedHistoryRisk);
+                const canEliminateByTurningOffRag = !hasHistoricalRisk
+                  && egressPrompt.currentRagRisk
+                  && !egressPrompt.currentFileGrantRisk;
+                const canEliminateByManagingGrants = !hasHistoricalRisk && egressPrompt.currentFileGrantRisk;
+                const reasons: string[] = [];
+                if (egressPrompt.currentRagRisk) reasons.push('本轮已开启教材知识库 RAG');
+                if (egressPrompt.currentFileGrantRisk) reasons.push('当前会话存在本地文件读取授权');
+                if (egressPrompt.historicalRagRisk) reasons.push('会话历史包含教材检索上下文');
+                if (egressPrompt.historicalFileRisk) reasons.push('会话历史包含已读取的本地文件内容');
+                if (egressPrompt.backendForcedHistoryRisk && !egressPrompt.historicalRagRisk && !egressPrompt.historicalFileRisk) {
+                  reasons.push('会话包含旧版本或来源不可验证的历史对话上下文');
+                }
+                return (
+                  <div className="egress-confirm-card" role="dialog" aria-modal="false" aria-label="本轮外部数据外发确认">
+                    <div className="egress-confirm-header">
+                      <strong>外部数据外发安全确认（仅本轮有效）</strong>
+                    </div>
+                    <p className="egress-confirm-body">
+                      当前对话可能包含本地文件或教材内容。允许 MCP 工具协作时，模型可能将部分对话内容发送给外部 MCP 服务。
+                    </p>
+                    {reasons.length > 0 && (
+                      <p className="egress-confirm-reasons">
+                        触发原因：{reasons.join('；')}。
+                        {hasHistoricalRisk && '由于历史上下文已保留在当前对话中，仅关闭当前开关无法消除历史内容外发风险。'}
+                      </p>
+                    )}
+                    {egressPrompt.backendMessage && (
+                      <p className="egress-confirm-backend">{egressPrompt.backendMessage}</p>
+                    )}
+                    <div className="egress-confirm-actions">
+                      <button
+                        type="button"
+                        className="mcp-btn primary sm"
+                        onClick={() => {
+                          const targetQuestion = egressPrompt.question;
+                          setEgressPrompt(undefined);
+                          void executeSend(active, targetQuestion, { allowExternalDataEgress: true });
+                        }}>
+                        仅本轮授权必要的数据外发
+                      </button>
+                      <button
+                        type="button"
+                        className="mcp-btn secondary sm"
+                        onClick={() => {
+                          toggleMcpEnabled(false);
+                          setEgressPrompt(undefined);
+                        }}>
+                        关闭 MCP
+                      </button>
+                      {canEliminateByTurningOffRag && (
+                        <button
+                          type="button"
+                          className="mcp-btn secondary sm"
+                          onClick={() => {
+                            setRagEnabled(false);
+                            setEgressPrompt(undefined);
+                          }}>
+                          关闭教材 RAG
+                        </button>
+                      )}
+                      {canEliminateByManagingGrants && (
+                        <>
+                          {egressPrompt.currentRagRisk && (
+                            <button
+                              type="button"
+                              className="mcp-btn secondary sm"
+                              onClick={() => {
+                                setRagEnabled(false);
+                                setEgressPrompt(undefined);
+                              }}>
+                              关闭教材 RAG
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="mcp-btn secondary sm"
+                            onClick={() => {
+                              setGrantsOpen(true);
+                              setScopeOpen(false);
+                              setEgressPrompt(undefined);
+                            }}>
+                            管理文件授权
+                          </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        className="mcp-btn secondary sm"
+                        disabled={creating}
+                        onClick={() => {
+                          const draftQuestion = egressPrompt.question;
+                          setEgressPrompt(undefined);
+                          void createSession(draftQuestion);
+                        }}>
+                        开启新对话
+                      </button>
+                      <button
+                        type="button"
+                        className="mcp-btn ghost sm"
+                        onClick={() => setEgressPrompt(undefined)}>
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+
               <form ref={formRef} className="composer" onSubmit={send}>
                 <label htmlFor="question" className="sr-only">问题</label>
                 <textarea
@@ -1049,7 +1422,7 @@ export default function Chat({
                   }}
                 />
                 <div className="composer-bottom-bar">
-                  <section className="knowledge-qa-inline" aria-label="教材知识库问答设置">
+                  <section className="knowledge-qa-inline" aria-label="教材知识库与工具设置">
                     <label className={`rag-pill-toggle ${ragEnabled ? 'is-on' : ''}`}>
                       <input
                         type="checkbox"
@@ -1058,6 +1431,20 @@ export default function Chat({
                         onChange={(e) => setRagEnabled(e.target.checked)}
                       />
                       <span>教材知识库 RAG</span>
+                    </label>
+                    <label className={`rag-pill-toggle mcp-pill-toggle ${mcpEnabled ? 'is-on' : ''}`}>
+                      <input
+                        type="checkbox"
+                        aria-label="启用 MCP 工具"
+                        checked={mcpEnabled}
+                        onChange={(e) => toggleMcpEnabled(e.target.checked)}
+                      />
+                      <span>
+                        MCP 工具
+                        {effectiveMcpSummary !== undefined
+                          ? `（${effectiveMcpSummary.effective_allowed_tools} 个可用）`
+                          : ''}
+                      </span>
                     </label>
                     {ragEnabled && (
                       <div className="knowledge-qa-selects">
@@ -1087,7 +1474,16 @@ export default function Chat({
 
                   <div className="composer-actions">
                     {!modelConfigured && <p className="composer-hint">配置 DeepSeek API Key 后即可发送。</p>}
-                    {active.submittingError && <p role="alert" className="composer-hint">{active.submittingError}</p>}
+                    {active.submittingError && (
+                      <p role="alert" className="composer-hint composer-error">
+                        <span>{active.submittingError}</span>
+                        {onOpenMcpPanel && isMcpManageableError(active.submittingErrorCode) && (
+                          <button type="button" className="inline-jump-btn" onClick={onOpenMcpPanel}>
+                            前往 MCP 服务
+                          </button>
+                        )}
+                      </p>
+                    )}
                     {tooLong && <p role="alert" className="composer-hint">问题最多 {MESSAGE_LIMIT.toLocaleString('zh-CN')} 字符。</p>}
                     {trackedRunId && active.activeStatus && !isTerminal(active.activeStatus) && (
                       <button

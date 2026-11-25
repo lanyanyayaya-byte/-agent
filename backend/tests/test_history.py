@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 import httpx
 
-from app.storage.business import MIGRATIONS, BusinessStore, SCHEMA_V1
+from app.storage.business import MIGRATIONS, SCHEMA_VERSION, BusinessStore, SCHEMA_V1
 from test_chat import (
     SESSIONS, ProviderStream, configure, frames, live_api, new_session, next_event, payload, run_path,
 )
@@ -123,7 +123,7 @@ def test_v1_migration_preserves_rows_and_pagination_with_equal_timestamps(legacy
     assert [r.run_id for r in summary] == sorted((r.run_id for r in summary), reverse=True)
     assert store.list_runs(session, 3, (summary[0].started_at, summary[0].run_id)) == summary[1:]
     with closing(store._connect()) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (5,)
+        assert db.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -150,7 +150,7 @@ def test_v2_upgrade_preserves_every_row_and_enforces_future_checkpointed_complet
 
     store = BusinessStore(path)
     with closing(store._connect()) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (5,)
+        assert db.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         for table, old_rows in before.items():

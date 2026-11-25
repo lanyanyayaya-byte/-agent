@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, MutexGuard};
@@ -6,8 +7,13 @@ use zeroize::Zeroizing;
 pub(crate) const DEEPSEEK_PROVIDER: &str = "deepseek";
 pub(crate) const SILICONFLOW_PROVIDER: &str = "siliconflow";
 pub(crate) const CREDENTIAL_REJECTED: &str = "MODEL_CREDENTIAL_REJECTED";
+pub(crate) const MCP_CREDENTIAL_REJECTED: &str = "MCP_CREDENTIAL_REJECTED";
 pub(crate) const KEYCHAIN_ACCESS_FAILED: &str = "KEYCHAIN_ACCESS_FAILED";
 pub(crate) const KEYCHAIN_CREDENTIAL_CORRUPTED: &str = "KEYCHAIN_CREDENTIAL_CORRUPTED";
+
+pub(crate) const MCP_MAX_SECRET_VALUE_BYTES: usize = 4096;
+pub(crate) const MCP_MAX_SECRET_ENTRIES: usize = 64;
+pub(crate) const MCP_MAX_BUNDLE_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeychainError {
@@ -139,6 +145,179 @@ impl CredentialStore {
     pub(crate) fn delete(&self, provider: &str) -> Result<(), KeychainError> {
         self.backend
             .delete(&self.service, credential_account(provider)?)
+    }
+}
+
+pub(crate) fn is_valid_mcp_server_id(server_id: &str) -> bool {
+    let bytes = server_id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 128 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_' | b'-'))
+}
+
+pub(crate) fn mcp_credential_account(server_id: &str) -> Result<String, KeychainError> {
+    if !is_valid_mcp_server_id(server_id) {
+        return Err(KeychainError::Rejected);
+    }
+    Ok(format!("mcp-server:{server_id}"))
+}
+
+pub(crate) fn is_valid_mcp_secret_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 128 {
+        return false;
+    }
+    bytes.iter().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                *b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    })
+}
+
+pub(crate) fn is_valid_mcp_secret_value(value: &str) -> bool {
+    if value.is_empty() || value.len() > MCP_MAX_SECRET_VALUE_BYTES {
+        return false;
+    }
+    // Allow printable UTF-8 including spaces (e.g. "Bearer xxx"), reject NUL, CR, LF and ASCII controls.
+    !value
+        .bytes()
+        .any(|b| b == 0 || b == b'\r' || b == b'\n' || b < 0x20 || b == 0x7f)
+}
+
+pub(crate) fn validate_mcp_secrets(
+    secrets: &BTreeMap<String, Zeroizing<String>>,
+) -> Result<(), KeychainError> {
+    if secrets.len() > MCP_MAX_SECRET_ENTRIES {
+        return Err(KeychainError::Rejected);
+    }
+    for (key, value) in secrets {
+        if !is_valid_mcp_secret_key(key) || !is_valid_mcp_secret_value(value) {
+            return Err(KeychainError::Rejected);
+        }
+    }
+    Ok(())
+}
+
+/// Physically isolated Keychain store for MCP server credentials under `{identifier}.mcp-credentials`.
+/// Never reads, modifies, or shares namespace with `{identifier}.model-credentials`.
+pub(crate) struct McpCredentialStore {
+    service: String,
+    backend: Arc<dyn CredentialBackend>,
+    lock: Mutex<()>,
+}
+
+impl McpCredentialStore {
+    pub(crate) fn for_identifier(identifier: &str) -> Arc<Self> {
+        let trimmed = identifier.trim();
+        let base = if trimmed.is_empty() {
+            "local.knowledgeagent.desktop"
+        } else {
+            trimmed
+        };
+        let service = std::env::var("KNOWLEDGEAGENT_MCP_KEYCHAIN_SERVICE")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("{base}.mcp-credentials"));
+        Self::with_backend(service, Arc::new(PlatformKeychain))
+    }
+
+    pub(crate) fn with_backend(
+        service: impl Into<String>,
+        backend: Arc<dyn CredentialBackend>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            service: service.into(),
+            backend,
+            lock: Mutex::new(()),
+        })
+    }
+
+    pub(crate) fn service(&self) -> &str {
+        &self.service
+    }
+
+    pub(crate) async fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().await
+    }
+
+    pub(crate) fn load(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<BTreeMap<String, Zeroizing<String>>>, KeychainError> {
+        let account = mcp_credential_account(server_id)?;
+        let Some(raw) = self.backend.load(&self.service, &account)? else {
+            return Ok(None);
+        };
+        if raw.len() > MCP_MAX_BUNDLE_BYTES {
+            return Err(KeychainError::Corrupted);
+        }
+        let parsed: BTreeMap<String, String> =
+            serde_json::from_str(&raw).map_err(|_| KeychainError::Corrupted)?;
+        let mut secrets = BTreeMap::new();
+        for (key, value) in parsed {
+            if !is_valid_mcp_secret_key(&key) || !is_valid_mcp_secret_value(&value) {
+                return Err(KeychainError::Corrupted);
+            }
+            secrets.insert(key, Zeroizing::new(value));
+        }
+        if secrets.len() > MCP_MAX_SECRET_ENTRIES {
+            return Err(KeychainError::Corrupted);
+        }
+        Ok(Some(secrets))
+    }
+
+    pub(crate) fn save(
+        &self,
+        server_id: &str,
+        secrets: &BTreeMap<String, Zeroizing<String>>,
+    ) -> Result<(), KeychainError> {
+        let account = mcp_credential_account(server_id)?;
+        if secrets.is_empty() {
+            return self.backend.delete(&self.service, &account);
+        }
+        validate_mcp_secrets(secrets)?;
+        let plain_map: BTreeMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let encoded = Zeroizing::new(
+            serde_json::to_string(&plain_map).map_err(|_| KeychainError::Rejected)?,
+        );
+        if encoded.len() > MCP_MAX_BUNDLE_BYTES {
+            return Err(KeychainError::Rejected);
+        }
+        self.backend.save(&self.service, &account, &encoded)?;
+        match self.load(server_id)? {
+            Some(stored) if stored == *secrets => Ok(()),
+            _ => Err(KeychainError::Unavailable(-1)),
+        }
+    }
+
+    pub(crate) fn delete(&self, server_id: &str) -> Result<(), KeychainError> {
+        let account = mcp_credential_account(server_id)?;
+        self.backend.delete(&self.service, &account)
     }
 }
 
@@ -493,5 +672,86 @@ mod tests {
         }
         store.delete(DEEPSEEK_PROVIDER).unwrap();
         assert_eq!(store.load(DEEPSEEK_PROVIDER).unwrap(), None);
+    }
+
+    struct ScopedRealMcpKeychain {
+        store: Arc<McpCredentialStore>,
+        server_ids: Vec<String>,
+    }
+
+    impl ScopedRealMcpKeychain {
+        fn new(server_ids: &[&str]) -> Self {
+            let service = format!("local.knowledgeagent.desktop.test.{}.mcp-credentials", random_hex());
+            Self {
+                store: McpCredentialStore::with_backend(service, Arc::new(PlatformKeychain)),
+                server_ids: server_ids.iter().map(|s| (*s).to_owned()).collect(),
+            }
+        }
+    }
+
+    impl Drop for ScopedRealMcpKeychain {
+        fn drop(&mut self) {
+            for id in &self.server_ids {
+                let _ = self.store.delete(id);
+            }
+        }
+    }
+
+    #[test]
+    fn real_macos_mcp_keychain_isolation_spaces_length_rotation_and_cleanup() {
+        let model_scoped = ScopedRealKeychain::new();
+        let mcp_scoped = ScopedRealMcpKeychain::new(&["srv-alpha", "srv-beta"]);
+        let mcp = &mcp_scoped.store;
+        assert_ne!(model_scoped.store.service(), mcp.service());
+
+        // Initially absent
+        assert_eq!(mcp.load("srv-alpha").unwrap(), None);
+        assert_eq!(mcp.delete("srv-alpha"), Ok(()));
+
+        // Validation rules: spaces allowed, NUL/CR/LF rejected, >4096 bytes rejected
+        let mut bad_newline = BTreeMap::new();
+        bad_newline.insert("Authorization".to_owned(), Zeroizing::new("Bearer abc\r\nX-Injected: 1".to_owned()));
+        assert_eq!(mcp.save("srv-alpha", &bad_newline), Err(KeychainError::Rejected));
+
+        let mut bad_oversized = BTreeMap::new();
+        bad_oversized.insert("API_KEY".to_owned(), Zeroizing::new("x".repeat(MCP_MAX_SECRET_VALUE_BYTES + 1)));
+        assert_eq!(mcp.save("srv-alpha", &bad_oversized), Err(KeychainError::Rejected));
+
+        // Valid secret with spaces (Bearer token) + long JWT-like token up to 4096 bytes
+        let long_token = format!("Bearer {}", "a".repeat(2048));
+        let mut alpha_secrets = BTreeMap::new();
+        alpha_secrets.insert("Authorization".to_owned(), Zeroizing::new(long_token.clone()));
+        alpha_secrets.insert("X-Tenant-Key".to_owned(), Zeroizing::new(format!("tenant-{}", random_hex())));
+        mcp.save("srv-alpha", &alpha_secrets).unwrap();
+
+        // Separate server has independent secrets; model credential store remains completely untouched
+        let mut beta_secrets = BTreeMap::new();
+        beta_secrets.insert("API_TOKEN".to_owned(), Zeroizing::new(format!("beta-{}", random_hex())));
+        mcp.save("srv-beta", &beta_secrets).unwrap();
+
+        assert_eq!(mcp.load("srv-alpha").unwrap(), Some(alpha_secrets.clone()));
+        assert_eq!(mcp.load("srv-beta").unwrap(), Some(beta_secrets.clone()));
+        assert_eq!(model_scoped.store.load(DEEPSEEK_PROVIDER).unwrap(), None);
+
+        // Rotate secret
+        let mut rotated = alpha_secrets.clone();
+        rotated.insert("Authorization".to_owned(), Zeroizing::new(format!("Bearer rotated-{}", random_hex())));
+        mcp.save("srv-alpha", &rotated).unwrap();
+        assert_eq!(mcp.load("srv-alpha").unwrap(), Some(rotated));
+
+        // Saving empty map deletes Keychain entry
+        mcp.save("srv-alpha", &BTreeMap::new()).unwrap();
+        assert_eq!(mcp.load("srv-alpha").unwrap(), None);
+
+        // Corruption detection on invalid JSON in real Keychain
+        let account = mcp_credential_account("srv-alpha").unwrap();
+        macos::add_raw(mcp.service(), &account, b"{not-valid-json").unwrap();
+        assert_eq!(mcp.load("srv-alpha"), Err(KeychainError::Corrupted));
+        mcp.delete("srv-alpha").unwrap();
+        assert_eq!(mcp.load("srv-alpha").unwrap(), None);
+
+        // Clean delete
+        mcp.delete("srv-beta").unwrap();
+        assert_eq!(mcp.load("srv-beta").unwrap(), None);
     }
 }
