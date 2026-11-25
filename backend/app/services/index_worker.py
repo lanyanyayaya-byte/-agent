@@ -11,7 +11,7 @@ from app.services.document_embeddings import DocumentEmbeddingService
 from app.services.index_pipeline import IndexPipeline
 from app.services.index_readiness import IndexReadiness
 from app.storage.index_jobs import (
-    DEFAULT_LEASE_SECONDS, PIPELINE_JOB_TYPE, IndexJob, IndexJobClaim, IndexJobError, IndexJobStage, IndexJobStatus,
+    ALL_PIPELINE_JOB_TYPES, DEFAULT_LEASE_SECONDS, IndexJob, IndexJobClaim, IndexJobError, IndexJobStage, IndexJobStatus,
 )
 
 POLL_SECONDS = 1
@@ -86,7 +86,7 @@ class IndexWorker:
             while not stopping.is_set():
                 try:
                     claim = await asyncio.to_thread(
-                        self.jobs.claim_next, self.instance_id, job_type=PIPELINE_JOB_TYPE,
+                        self.jobs.claim_next, self.instance_id, job_type=ALL_PIPELINE_JOB_TYPES,
                         lease_seconds=self.lease_seconds, config_keys=self.config_keys, wait=False,
                     )
                     if claim is not None:

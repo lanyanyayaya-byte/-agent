@@ -234,6 +234,18 @@ MIGRATIONS = (
         "ALTER TABLE tool_calls ADD COLUMN tool_category TEXT CHECK (tool_category IS NULL OR tool_category IN ('skill', 'workspace', 'runtime'))",
         "ALTER TABLE tool_calls ADD COLUMN recoverable INTEGER NOT NULL DEFAULT 0 CHECK (recoverable IN (0, 1))",
     ),
+    (
+        """CREATE TABLE run_retrieval_traces (
+            run_id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            trace_version INTEGER NOT NULL DEFAULT 1,
+            summary_json TEXT NOT NULL,
+            trace_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id, run_id) REFERENCES runs (session_id, run_id) ON DELETE CASCADE
+        )""",
+        "CREATE INDEX run_retrieval_traces_by_session ON run_retrieval_traces (session_id, created_at DESC)",
+    ),
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -347,6 +359,7 @@ class RunSummary:
     citations: tuple[StoredCitation, ...] = ()
     artifacts: tuple[StoredArtifact, ...] = ()
     skill_activations: tuple[StoredSkillActivation, ...] = ()
+    retrieval_trace_summary: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -512,6 +525,7 @@ class BusinessStore:
                 raise RunConflict("RUN_ALREADY_ACTIVE", active[0])
             connection.execute("DELETE FROM run_skill_activations WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM artifacts WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM run_retrieval_traces WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM workspace_files WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM run_citations WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
@@ -660,6 +674,20 @@ class BusinessStore:
                     activated_at=activated_at,
                 ))
 
+            traces_by_run: dict[str, dict[str, object]] = {}
+            for run_id, summary_json in connection.execute(
+                f"""SELECT run_id, summary_json
+                    FROM run_retrieval_traces
+                    WHERE session_id = ? AND run_id IN ({placeholders})""",
+                (session_id, *run_ids),
+            ):
+                try:
+                    parsed = json.loads(summary_json)
+                    if isinstance(parsed, dict):
+                        traces_by_run[run_id] = parsed
+                except json.JSONDecodeError:
+                    pass
+
             return [
                 RunSummary(
                     *row,
@@ -667,9 +695,44 @@ class BusinessStore:
                     citations=tuple(citations_by_run.get(row[0], ())),
                     artifacts=tuple(artifacts_by_run.get(row[0], ())),
                     skill_activations=tuple(activations_by_run.get(row[0], ())),
+                    retrieval_trace_summary=traces_by_run.get(row[0]),
                 )
                 for row in rows
             ]
+
+    def save_retrieval_trace(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        summary: dict[str, object],
+        trace: dict[str, object],
+        trace_version: int = 1,
+    ) -> None:
+        now = utc_now()
+        summary_json = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        trace_json = json.dumps(trace, ensure_ascii=False, separators=(",", ":"))
+        with closing(self._connect()) as connection, self._write(connection):
+            connection.execute(
+                """INSERT INTO run_retrieval_traces (run_id, session_id, trace_version, summary_json, trace_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (run_id) DO UPDATE SET
+                       trace_version = excluded.trace_version,
+                       summary_json = excluded.summary_json,
+                       trace_json = excluded.trace_json""",
+                (run_id, session_id, trace_version, summary_json, trace_json, now),
+            )
+
+    def get_retrieval_trace(self, run_id: str) -> dict[str, object] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT trace_json FROM run_retrieval_traces WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            parsed = json.loads(row[0])
+            return parsed if isinstance(parsed, dict) else None
 
     def require_session(self, session_id: str) -> None:
         with closing(self._connect()) as connection:

@@ -235,6 +235,62 @@ def _ocr_page_chunk(
     return out
 
 
+def ocr_selected_pages(
+    data: bytes,
+    page_numbers: list[int],
+    *,
+    scale: float = 1.35,
+) -> dict[int, tuple[float, float, list[tuple[str, tuple[float, float, float, float]]]]]:
+    """Run macOS Vision OCR ONLY on specific 1-based scanned insert pages of a digital PDF."""
+    b = _get_bindings()
+    if b is None or not page_numbers:
+        return {}
+    provider = b.cg.CGDataProviderCreateWithData(None, data, len(data), None)
+    if not provider:
+        return {}
+    try:
+        workers = min(4, max(1, len(page_numbers)))
+        shards = [page_numbers[i::workers] for i in range(workers)]
+        page_map: dict[int, tuple[float, float, list[tuple[str, tuple[float, float, float, float]]]]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_ocr_page_chunk, b, provider, shard, scale) for shard in shards if shard]
+            for fut in futures:
+                page_map.update(fut.result())
+        return page_map
+    finally:
+        b.cg.CGDataProviderRelease(provider)
+
+
+def _norm_ocr_edge(text: str) -> str:
+    return re.sub(r"\d+", "#", " ".join(text.split())).strip().casefold()
+
+
+def _detect_ocr_running_headers(
+    page_map: dict[int, tuple[float, float, list[tuple[str, tuple[float, float, float, float]]]]],
+) -> set[str]:
+    """Detect repeated running headers/footers across scanned pages before heading classification."""
+    if len(page_map) < 4:
+        return set()
+    from collections import Counter
+
+    edge_counts: Counter[str] = Counter()
+    for _pno, (_w, page_h, raw_lines) in page_map.items():
+        seen_on_page: set[str] = set()
+        for text, box in raw_lines:
+            if box[1] <= page_h * 0.11 or box[3] >= page_h * 0.89:
+                norm = _norm_ocr_edge(text)
+                if norm and len(norm) <= 64 and norm not in seen_on_page:
+                    seen_on_page.add(norm)
+                    edge_counts[norm] += 1
+    threshold = max(3, min(5, int(len(page_map) * 0.16)))
+    return {norm for norm, cnt in edge_counts.items() if cnt >= threshold}
+
+
+def _is_standalone_page_number(text: str) -> bool:
+    s = text.strip()
+    return bool(re.fullmatch(r"(?:[-—·•]\s*)?\d{1,4}(?:\s*[-—·•])?|(?:第\s*\d{1,4}\s*页)|[ivxlcdmIVXLCDM]{1,6}", s))
+
+
 def _heading_level_ocr(text: str, size: float, body_size: float) -> int | None:
     if len(text) > 85 or "..." in text or "⋯" in text or "…" in text:
         return None
@@ -279,6 +335,8 @@ def ocr_scanned_pdf(
     finally:
         b.cg.CGDataProviderRelease(provider)
 
+    running_edges = _detect_ocr_running_headers(page_map)
+
     sections: list[Section] = []
     active_sections: list[Section] = []
     blocks: list[ContentBlock] = []
@@ -295,14 +353,14 @@ def ocr_scanned_pdf(
             warnings.append(ParseWarning("PDF_NO_TEXT_LAYER", "No usable text was extracted from this page.", physical_page))
             continue
 
-        page_w, _page_h, raw_lines = entry
+        page_w, page_h, raw_lines = entry
         heights = [box[3] - box[1] for _, box in raw_lines]
         body_size = median(heights) if heights else 12.0
         # Sort top-to-bottom with vertical tolerance for lines on the same row
         row_tol = max(4.0, body_size * 0.45)
         sorted_lines = sorted(raw_lines, key=lambda item: (round(item[1][1] / row_tol), item[1][0]))
 
-        # Merge horizontal fragments on the same row and group lines into paragraphs
+        # Merge horizontal fragments on the same row and filter running headers/footers BEFORE heading detection!
         merged_rows: list[tuple[str, tuple[float, float, float, float]]] = []
         for text, box in sorted_lines:
             if merged_rows:
@@ -319,12 +377,25 @@ def ocr_scanned_pdf(
                     continue
             merged_rows.append((text, box))
 
+        filtered_rows: list[tuple[str, tuple[float, float, float, float]]] = []
+        for text, box in merged_rows:
+            in_top_band = box[1] <= page_h * 0.11
+            in_bottom_band = box[3] >= page_h * 0.89
+            if in_top_band or in_bottom_band:
+                if _is_standalone_page_number(text) or _norm_ocr_edge(text) in running_edges:
+                    continue
+            filtered_rows.append((text, box))
+
         page_groups: list[tuple[list[tuple[str, tuple[float, float, float, float]]], int | None]] = []
         current_group: list[tuple[str, tuple[float, float, float, float]]] = []
 
-        for text, box in merged_rows:
+        for text, box in filtered_rows:
             line_h = box[3] - box[1]
-            level = _heading_level_ocr(text, line_h, body_size)
+            # Never promote lines inside the very top running-header strip unless clearly larger than body font
+            if box[1] <= page_h * 0.085 and line_h < body_size * 1.15:
+                level = None
+            else:
+                level = _heading_level_ocr(text, line_h, body_size)
             if level is not None:
                 if current_group:
                     page_groups.append((current_group, None))

@@ -488,6 +488,18 @@ class CitationResolver:
         return self._resolve(tuple(_Request(hit.chunk_id, hit, document_id=hit.document_id,
                                             set_id=hit.chunk_set_id) for hit in hits), scope)
 
+    def resolve_chunk_refs(
+        self,
+        refs: Sequence[tuple[str, str, int]],
+        *,
+        scope: CitationScope = CitationScope(),
+    ) -> tuple[CitationResolution, ...]:
+        """Resolve a batch of (chunk_id, document_id, chunk_set_id) references with full original verification."""
+        if not refs:
+            return ()
+        reqs = tuple(_Request(cid, document_id=doc_id, set_id=cs_id) for cid, doc_id, cs_id in refs)
+        return self._resolve(reqs, scope)
+
     def validate_evidence(self, evidence_id: str, *, scope: CitationScope = CitationScope()) -> CitationResolution:
         match = _EVIDENCE_ID.fullmatch(evidence_id) if isinstance(evidence_id, str) else None
         if match is None or int(match[2]) > 2**63 - 1:

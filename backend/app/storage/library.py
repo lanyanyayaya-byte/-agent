@@ -70,7 +70,14 @@ SCHEMA_V2 = (
         outcome TEXT NOT NULL CHECK (outcome IN ('imported', 'duplicate', 'updated', 'unchanged'))
     )""",
 )
-MIGRATIONS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7)
+SCHEMA_V8 = (
+    """CREATE TABLE knowledge_settings (
+        key TEXT PRIMARY KEY NOT NULL,
+        value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+        updated_at TEXT NOT NULL
+    )""",
+)
+MIGRATIONS = (SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 DocumentFormat = Literal["pdf", "docx", "md"]

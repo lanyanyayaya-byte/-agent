@@ -101,6 +101,8 @@ fn main() {
             grants::select_file_grant,
             grants::revoke_file_grant,
             library::select_and_import_document,
+            library::select_and_import_documents,
+            library::open_textbook_original,
             mcp::mcp_save_server,
             mcp::mcp_import_servers_json,
             mcp::mcp_trust_server,

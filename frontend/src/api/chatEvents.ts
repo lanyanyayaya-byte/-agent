@@ -43,6 +43,120 @@ export type ArtifactSummary = {
   file_exists?: boolean;
 };
 
+export type RetrievalTraceSummary = {
+  trace_id: string;
+  actual_strategy: string;
+  requested_mode: string;
+  effective_channels: string[];
+  in_scope_documents: number;
+  searchable_documents: number;
+  hit_documents: number;
+  cited_documents: number;
+  prompt_evidence_count: number;
+  bm25_used: boolean;
+  vector_used: boolean;
+  rerank_used: boolean;
+  total_elapsed_ms: number;
+  context_expansion: number;
+  degraded: boolean;
+  degrade_reasons: string[];
+  warnings: string[];
+  error_code: string | null;
+  error_message: string | null;
+  summary_coverage?: Record<string, unknown> | null;
+};
+
+export type StageTraceView = {
+  stage: string;
+  status: 'ok' | 'skipped' | 'degraded' | 'failed';
+  candidate_count: number;
+  elapsed_ms: number;
+  error_code?: string | null;
+  message?: string | null;
+};
+
+export type CandidateTraceView = {
+  chunk_id: string;
+  document_id: string;
+  textbook_name?: string | null;
+  chunk_index: number;
+  page_range?: string | null;
+  section_path: string[];
+  bm25_raw?: number | null;
+  bm25_rank?: number | null;
+  cosine?: number | null;
+  vector_rank?: number | null;
+  rrf_score?: number | null;
+  rrf_rank?: number | null;
+  rerank_score?: number | null;
+  rerank_rank?: number | null;
+  selected: boolean;
+  exclusion_reason?: string | null;
+  is_reference_chunk?: boolean;
+  is_neighbor_expansion?: boolean;
+  snippet?: string | null;
+};
+
+export type DocumentTraceView = {
+  document_id: string;
+  textbook_name?: string | null;
+  version_id?: string | null;
+  keyword_indexed: boolean;
+  vector_indexed: boolean | null;
+  searched_channels: string[];
+  evidence_status: string;
+  returned_count: number;
+  skip_reason?: string | null;
+};
+
+export type RetrievalTraceData = {
+  trace_id: string;
+  original_query: string;
+  resolved_query: string;
+  query_variants: string[];
+  requested_strategy: string;
+  actual_strategy: string;
+  requested_mode: string;
+  effective_channels: string[];
+  in_scope_documents: number;
+  searchable_documents: number;
+  hit_documents: number;
+  cited_documents: number;
+  documents: DocumentTraceView[];
+  stages: StageTraceView[];
+  candidates: CandidateTraceView[];
+  final_evidence_ids: string[];
+  prompt_evidence_count: number;
+  estimated_tokens: number;
+  degraded: boolean;
+  degrade_reasons: string[];
+  warnings: string[];
+  chinese_terms?: string[];
+  english_terms?: string[];
+  rewrite_mode?: string;
+  rewrite_reason?: string | null;
+  bm25_used?: boolean;
+  vector_used?: boolean;
+  rerank_used?: boolean;
+  total_elapsed_ms?: number;
+  context_expansion?: number;
+  summary_coverage?: {
+    document_id?: string;
+    textbook_name?: string;
+    summary_mode?: string;
+    total_chunks?: number;
+    selected_chunks?: number;
+    covered_sections?: string[];
+    skipped_sections?: { section: string; reason: string }[];
+    covered_pages_count?: number;
+    uncovered_pages_count?: number;
+    covered_page_range?: string;
+  } | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  total_candidates_recorded?: number;
+};
+
 export type ToolEventMetadata = {
   source?: ToolSource;
   tool_category?: ToolCategory | null;
@@ -80,6 +194,13 @@ export type RunEvent = Envelope & (
         retrieval_query: string;
         coverage_mode: string;
         channel_status: string;
+      };
+    }
+  | {
+      type: 'retrieval_trace';
+      data: {
+        summary: RetrievalTraceSummary;
+        trace: RetrievalTraceData;
       };
     }
   | { type: 'run_completed'; data: { message_id: string; artifacts?: ArtifactSummary[] } }
@@ -221,6 +342,18 @@ export function parseRunEvent(value: unknown): RunEvent | undefined {
             retrieval_query: typeof data.retrieval_query === 'string' ? data.retrieval_query : '',
             coverage_mode: typeof data.coverage_mode === 'string' ? data.coverage_mode : 'global',
             channel_status: typeof data.channel_status === 'string' ? data.channel_status : 'hybrid',
+          },
+        };
+      }
+      break;
+    case 'retrieval_trace':
+      if (isRecord(data.summary) && isRecord(data.trace)) {
+        return {
+          ...envelope,
+          type,
+          data: {
+            summary: data.summary as RetrievalTraceSummary,
+            trace: data.trace as RetrievalTraceData,
           },
         };
       }

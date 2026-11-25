@@ -38,6 +38,16 @@ pub(crate) struct ImportResult {
     pub(crate) outcome: ImportOutcome,
 }
 
+#[derive(Serialize)]
+pub(crate) struct BatchImportItem {
+    pub(crate) filename: String,
+    pub(crate) ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result: Option<ImportResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<&'static str>,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ImportOutcome {
@@ -76,7 +86,8 @@ mod native {
     use tokio::sync::{watch, Mutex};
 
     use super::{
-        staging::StagedFile, valid_document_id, HostImport, ImportAction, ImportError, ImportResult,
+        staging::StagedFile, valid_document_id, BatchImportItem, HostImport, ImportAction,
+        ImportError, ImportResult,
     };
     use crate::{
         file_picker::{self, NativePicker, Selection},
@@ -268,6 +279,142 @@ mod native {
         }
     }
 
+    #[tauri::command]
+    pub(crate) async fn select_and_import_documents(
+        window: WebviewWindow,
+        sidecar: State<'_, Sidecar>,
+        importer: State<'_, LibraryImporter>,
+        picker: State<'_, NativePicker>,
+    ) -> Result<Vec<BatchImportItem>, ImportError> {
+        if window.label() != "main" {
+            return Err("IMPORT_FORBIDDEN".into());
+        }
+        let _pending = importer.pending.try_lock().map_err(|_| "IMPORT_BUSY")?;
+        let selected_paths = {
+            let _panel = picker.0.try_lock().map_err(|_| "IMPORT_PICKER_BUSY")?;
+            file_picker::pick_multiple_textbooks(window, "IMPORT_PICKER_FAILED").await?
+        };
+        if selected_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let host = sidecar.import_connection().await?;
+        let instance = host.instance_id();
+        let mut items = Vec::with_capacity(selected_paths.len());
+
+        for path_str in selected_paths {
+            let path = PathBuf::from(&path_str);
+            let fallback_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("未命名文件")
+                .to_owned();
+            let app_data = importer.app_data_dir.clone();
+            let copy = importer.begin_copy(sidecar.closing_signal());
+            let control = copy.control.clone();
+            let staged_res = tauri::async_runtime::spawn_blocking(move || {
+                StagedFile::prepare(&app_data, instance, &path, None, &control)
+            })
+            .await;
+            let (request, _staged) = match staged_res {
+                Ok(Ok(pair)) => {
+                    if let Err(code) = copy.finish() {
+                        items.push(BatchImportItem {
+                            filename: fallback_name,
+                            ok: false,
+                            result: None,
+                            error_code: Some(code),
+                        });
+                        continue;
+                    }
+                    drop(copy);
+                    pair
+                }
+                Ok(Err(code)) => {
+                    drop(copy);
+                    items.push(BatchImportItem {
+                        filename: fallback_name,
+                        ok: false,
+                        result: None,
+                        error_code: Some(code),
+                    });
+                    continue;
+                }
+                Err(_) => {
+                    drop(copy);
+                    items.push(BatchImportItem {
+                        filename: fallback_name,
+                        ok: false,
+                        result: None,
+                        error_code: Some("IMPORT_COPY_FAILED"),
+                    });
+                    continue;
+                }
+            };
+            let filename = request.filename.clone();
+            match host.import_document(&request).await {
+                Ok(result) => items.push(BatchImportItem {
+                    filename,
+                    ok: true,
+                    result: Some(result),
+                    error_code: None,
+                }),
+                Err(HostImportError::Rejected(code)) | Err(HostImportError::Uncertain(code)) => {
+                    items.push(BatchImportItem {
+                        filename,
+                        ok: false,
+                        result: None,
+                        error_code: Some(code),
+                    });
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    #[tauri::command]
+    pub(crate) async fn open_textbook_original(
+        window: WebviewWindow,
+        importer: State<'_, LibraryImporter>,
+        sha256: String,
+        filename: String,
+    ) -> Result<(), ImportError> {
+        if window.label() != "main" {
+            return Err("IMPORT_FORBIDDEN".into());
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err("INVALID_IMPORT_SOURCE".into());
+        }
+        let app_data = importer.app_data_dir.clone();
+        let src = app_data.join("knowledge").join("originals").join(&sha256);
+        if !src.is_file() {
+            return Err("TEXTBOOK_NOT_FOUND".into());
+        }
+        let safe_name: String = filename
+            .chars()
+            .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':'))
+            .take(120)
+            .collect();
+        let final_name = if safe_name.trim().is_empty() {
+            format!("{}.pdf", &sha256[..12])
+        } else {
+            format!("{}_{}", &sha256[..12], safe_name.trim())
+        };
+        let preview_dir = app_data.join("knowledge").join("preview_cache");
+        std::fs::create_dir_all(&preview_dir).map_err(|_| "IMPORT_COPY_FAILED")?;
+        let dst = preview_dir.join(final_name);
+        if !dst.is_file() {
+            std::fs::copy(&src, &dst).map_err(|_| "IMPORT_COPY_FAILED")?;
+        }
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg(&dst)
+            .status()
+            .map_err(|_| "IMPORT_COPY_FAILED")?;
+        if !status.success() {
+            return Err("IMPORT_COPY_FAILED".into());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -325,16 +472,46 @@ mod native {
 
 #[cfg(target_os = "macos")]
 pub(crate) use native::{
-    __cmd__select_and_import_document, __tauri_command_name_select_and_import_document,
+    __cmd__open_textbook_original, __cmd__select_and_import_document,
+    __cmd__select_and_import_documents, __tauri_command_name_open_textbook_original,
+    __tauri_command_name_select_and_import_document,
+    __tauri_command_name_select_and_import_documents,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use native::{select_and_import_document, LibraryImporter};
+pub(crate) use native::{
+    open_textbook_original, select_and_import_document, select_and_import_documents,
+    LibraryImporter,
+};
 
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
 pub(crate) async fn select_and_import_document(
     window: tauri::WebviewWindow,
 ) -> Result<Option<ImportResult>, ImportError> {
+    if window.label() != "main" {
+        return Err("IMPORT_FORBIDDEN".into());
+    }
+    Err("IMPORT_UNSUPPORTED_PLATFORM".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub(crate) async fn select_and_import_documents(
+    window: tauri::WebviewWindow,
+) -> Result<Option<Vec<BatchImportItem>>, ImportError> {
+    if window.label() != "main" {
+        return Err("IMPORT_FORBIDDEN".into());
+    }
+    Err("IMPORT_UNSUPPORTED_PLATFORM".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub(crate) async fn open_textbook_original(
+    window: tauri::WebviewWindow,
+    _sha256: String,
+    _filename: String,
+) -> Result<(), ImportError> {
     if window.label() != "main" {
         return Err("IMPORT_FORBIDDEN".into());
     }

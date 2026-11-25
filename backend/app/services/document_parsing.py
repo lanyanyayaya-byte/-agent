@@ -23,7 +23,7 @@ PARSED_STRUCTURE_VERSION = 1
 # change the profile key when effective options change. A model change bumps the shared structure version.
 PARSER_SPECS: dict[DocumentFormat, ParseSpec] = {
     "md": ParseSpec("1", PARSED_STRUCTURE_VERSION, "commonmark-table"),
-    "pdf": ParseSpec("2", PARSED_STRUCTURE_VERSION, "text-layout"),
+    "pdf": ParseSpec("3", PARSED_STRUCTURE_VERSION, "text-layout"),
     "docx": ParseSpec("1", PARSED_STRUCTURE_VERSION, "word-body"),
 }
 

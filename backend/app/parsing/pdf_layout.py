@@ -32,7 +32,7 @@ from app.parsing.pdf import ERRORS
 MAX_PAGES = 1000
 MAX_PAGE_GLYPHS = 50_000
 MAX_DOCUMENT_GLYPHS = 2_000_000
-MAX_DOCUMENT_LINES = 50_000
+MAX_DOCUMENT_LINES = 150_000
 MAX_DOCUMENT_TEXT = 4_000_000
 MAX_LABEL_LENGTH = 64
 # Titles can start with a word such as "4-bit", as well as a letter.
@@ -41,10 +41,22 @@ ROMAN_HEADING = re.compile(r"^[IVXLCDM]{1,7}\.\s+[A-Z]")
 CHINESE_HEADING = re.compile(r"^第[零〇一二三四五六七八九十百0-9]+([章篇节])\s*[^\W\d_]")
 DOT_LEADER = re.compile(r"\.(?:\s*\.){2,}")
 TEX_SYMBOL_FONT = re.compile(r"^(?:[A-Z]{6}\+)?(?:CMSY|CMEX|CMMI|MSAM|MSBM)\d*$")
+TEX_MATH_ITALIC_FONT = re.compile(r"^(?:[A-Z]{6}\+)?CMMI\d*$")
+SAFE_UNICODE_MATH = re.compile(r"^[\u0370-\u03ff\u2032-\u2034\u2190-\u22ff\u27e8-\u27eb·−±×÷¬°′″∂∇∞≤≥≠≈∈∉⊂⊆∪∩∑∏∫]+$")
 BOLD_FONT = re.compile(r"bold|NimbusRomNo9L-Medi|\bCMBX\d|\bSimHei\b", re.I)
 NAMED_HEADINGS = {"abstract", "introduction", "conclusion", "conclusions", "acknowledgments",
                   "references", "appendix", "摘要", "引言", "结论", "参考文献", "附录"}
 UNMAPPED = re.compile(r"\(cid:\d+\)|[\ufffd\ue000-\uf8ff\U000f0000-\U0010fffd]")
+COMPOUND_HYPHEN_PREFIXES = frozenset({
+    "non", "semi", "multi", "sub", "pre", "post", "re", "co", "self", "two", "three",
+    "quasi", "pseudo", "finite", "high", "low", "well", "cross", "over", "under",
+    "anti", "inter", "intra", "auto", "bi", "tri", "un", "half", "full", "mid",
+    "counter", "micro", "macro", "super", "hyper", "mesh", "grid", "step", "time",
+    "space", "node", "edge", "face", "cell", "line", "point", "block", "level",
+    "order", "based", "free", "like", "type", "side", "first", "second", "third",
+})
+STANDALONE_PAGE_NO_RE = re.compile(r"^(?:[-—·•]\s*)?\d{1,4}(?:\s*[-—·•])?$|^(?:第\s*\d{1,4}\s*页)$|^[ivxlcdmIVXLCDM]{1,6}$")
+TOC_DOT_RUN_RE = re.compile(r"\s*\.(?:\s*\.){2,}\s*")
 Box = tuple[float, float, float, float]
 PageBlock = tuple[str, int | None, tuple[PdfSourceLocation, ...]]
 
@@ -176,6 +188,20 @@ def _uncertain_math_fonts(page: Page) -> set[str]:
     return names
 
 
+def _is_uncertain_tex_glyph(fontname: str, text: str, uncertain_fonts: set[str]) -> bool:
+    if UNMAPPED.search(text) or not (text.isprintable() or text.isspace()):
+        return True
+    if fontname not in uncertain_fonts or text.isspace():
+        return False
+    # pdfminer already decoded genuine Unicode Greek / math operators from Type1 glyph names (e.g. λ, β, −, ·).
+    if SAFE_UNICODE_MATH.fullmatch(text):
+        return False
+    # CMMI slots for ASCII letters and punctuation (a-z, A-Z, '.', ',') represent italic math variables.
+    if TEX_MATH_ITALIC_FONT.fullmatch(fontname) and text.isascii() and (text.isalpha() or text in ".,"):
+        return False
+    return True
+
+
 def _visible_glyphs(page: Page, crop: Box) -> tuple[list[dict], int, int]:
     count = len(page.chars)
     if count > MAX_PAGE_GLYPHS:
@@ -192,7 +218,7 @@ def _visible_glyphs(page: Page, crop: Box) -> tuple[list[dict], int, int]:
         if clipped is None:
             continue
         text = glyph["text"]
-        if UNMAPPED.search(text) or not (text.isprintable() or text.isspace()) or glyph["fontname"] in uncertain_fonts:
+        if _is_uncertain_tex_glyph(glyph["fontname"], text, uncertain_fonts):
             unknown += 1
             text = " "
         visible.append({
@@ -205,12 +231,24 @@ def _visible_glyphs(page: Page, crop: Box) -> tuple[list[dict], int, int]:
 def _make_line(glyphs: list[dict]) -> Line | None:
     words = []
     right = glyphs[0]["x0"]
+    prev_text = ""
     for glyph in glyphs:
         text = glyph["text"]
-        if text.isspace() or (words and glyph["x0"] - right > max(0.8, 0.12 * glyph["size"])):
+        gap = glyph["x0"] - right
+        # Slightly stricter gap threshold between adjacent lowercase ASCII letters avoids kerning word splits.
+        both_lower_ascii = (
+            bool(prev_text) and len(prev_text) == 1 and len(text) == 1
+            and prev_text.isascii() and prev_text.islower()
+            and text.isascii() and text.islower()
+        )
+        space_thresh = max(1.0, 0.17 * glyph["size"]) if both_lower_ascii else max(0.8, 0.13 * glyph["size"])
+        if text.isspace() or (words and gap > space_thresh):
             words.append(" ")
         if not text.isspace():
             words.append(text)
+            prev_text = text
+        else:
+            prev_text = ""
         right = max(right, glyph["x1"])
     text = " ".join("".join(words).split())
     if not text:
@@ -348,9 +386,19 @@ def _paragraphs(
         if group:
             last = group[-1]
             step = line.baseline - last.baseline
-            if (level is not None or not 0.48 * last.size <= step <= 1.65 * max(last.size, line.size)
+            max_sz = max(last.size, line.size)
+            is_formula_fragment = (
+                level is None
+                and -0.45 * max_sz <= step <= 1.55 * max_sz
+                and (len(line.text.strip()) <= 14 or len(last.text.strip()) <= 14)
+            )
+            if (not is_formula_fragment and (
+                    level is not None or not 0.48 * last.size <= step <= 1.65 * max_sz
                     or abs(line.size - last.size) > max(1, 0.15 * last.size)
-                    or abs(line.box[0] - last.box[0]) > max(7, 0.8 * last.size)):
+                    or abs(line.box[0] - last.box[0]) > max(7, 0.8 * last.size))):
+                yield group, None
+                group = []
+            elif level is not None:
                 yield group, None
                 group = []
         if level is None:
@@ -361,7 +409,50 @@ def _paragraphs(
         yield group, None
 
 
-def _page_blocks(page: Page, label: str | None) -> tuple[list[PageBlock], list[ParseWarning], int, int]:
+def _norm_edge_line(text: str) -> str:
+    return re.sub(r"\d+", "#", " ".join(text.split())).strip().casefold()
+
+
+def _join_paragraph_lines(group: list[Line], *, is_heading: bool) -> str:
+    """Join lines cleanly: de-hyphenate English line breaks while preserving real compound words & cleaning TOC dot leaders."""
+    if not group:
+        return ""
+    if is_heading or len(group) == 1:
+        raw = group[0].text
+        return TOC_DOT_RUN_RE.sub(" · ", raw) if DOT_LEADER.search(raw) else raw
+
+    out_lines: list[str] = []
+    for line in group:
+        t = TOC_DOT_RUN_RE.sub(" · ", line.text) if DOT_LEADER.search(line.text) else line.text
+        if out_lines:
+            prev = out_lines[-1]
+            m_left = re.search(r"([A-Za-z]{2,})-$", prev)
+            m_right = re.match(r"^([a-z]{2,})\b", t)
+            if m_left and m_right and m_left.group(1).casefold() not in COMPOUND_HYPHEN_PREFIXES:
+                out_lines[-1] = prev[:-1] + t
+                continue
+        out_lines.append(t)
+    return "\n".join(out_lines)
+
+
+@dataclass(slots=True)
+class _ExtractedPage:
+    physical_page: int
+    label: str | None
+    lines: list[Line]
+    body_size: float
+    width: float
+    height: float
+    rotation: int
+    analysis_rotation: int
+    analysis_width: float
+    analysis_height: float
+    unit: float
+    warnings: list[ParseWarning]
+    chars_count: int
+
+
+def _extract_page_raw(page: Page, label: str | None) -> tuple[_ExtractedPage, int, int]:
     width, height = page.width, page.height
     rotation = page.rotation
     unit = resolve1(page.page_obj.attrs.get("UserUnit", 1))
@@ -401,23 +492,76 @@ def _page_blocks(page: Page, label: str | None) -> tuple[list[PageBlock], list[P
             "PDF_MIXED_TEXT_DIRECTION", f"{excluded} glyphs outside the main text direction were omitted.",
             physical_page,
         ))
-
-    blocks = []
     body_size = median(g["size"] for g in glyphs) if glyphs else 0
-    toc_rows = {round(line.baseline) for line in lines if line.box[0] >= 0.70 * analysis_width
+    return (
+        _ExtractedPage(
+            physical_page=physical_page,
+            label=label,
+            lines=lines,
+            body_size=body_size,
+            width=width,
+            height=height,
+            rotation=rotation,
+            analysis_rotation=analysis_rotation,
+            analysis_width=analysis_width,
+            analysis_height=analysis_height,
+            unit=float(unit),
+            warnings=warnings,
+            chars_count=chars,
+        ),
+        count,
+        len(lines),
+    )
+
+
+def _detect_running_headers(pages: list[_ExtractedPage]) -> set[str]:
+    """Identify repeated running headers/footers across multi-page PDFs before heading detection."""
+    if len(pages) < 4:
+        return set()
+    edge_counts: Counter[str] = Counter()
+    for pg in pages:
+        h = pg.analysis_height
+        seen: set[str] = set()
+        for line in pg.lines:
+            if line.box[1] <= h * 0.11 or line.box[3] >= h * 0.89:
+                norm = _norm_edge_line(line.text)
+                if norm and len(norm) <= 72 and norm not in seen:
+                    seen.add(norm)
+                    edge_counts[norm] += 1
+    threshold = max(3, min(5, int(len(pages) * 0.25)))
+    return {norm for norm, cnt in edge_counts.items() if cnt >= threshold}
+
+
+def _build_page_blocks(pg: _ExtractedPage, running_edges: set[str], multi_page: bool) -> list[PageBlock]:
+    lines = pg.lines
+    if multi_page and lines:
+        h = pg.analysis_height
+        filtered: list[Line] = []
+        for line in lines:
+            in_edge = line.box[1] <= h * 0.10 or line.box[3] >= h * 0.90
+            if in_edge:
+                if STANDALONE_PAGE_NO_RE.fullmatch(line.text.strip()):
+                    continue
+                if _norm_edge_line(line.text) in running_edges:
+                    continue
+            filtered.append(line)
+        lines = filtered
+
+    blocks: list[PageBlock] = []
+    toc_rows = {round(line.baseline) for line in lines if line.box[0] >= 0.70 * pg.analysis_width
                 and len(line.text) <= 4 and line.text.isascii() and line.text.isdigit()}
-    for region in _regions(lines, analysis_width):
-        for group, level in _paragraphs(region, body_size, toc_rows):
+    for region in _regions(lines, pg.analysis_width):
+        for group, level in _paragraphs(region, pg.body_size, toc_rows):
             locations = []
             for line in group:
-                displayed = _box_transform(line.box, -analysis_rotation % 360, analysis_width, analysis_height)
-                raw = _box_transform(displayed, -rotation % 360, width, height)
-                box = tuple(round(max(0, v) * unit, 6) for v in raw)
+                displayed = _box_transform(line.box, -pg.analysis_rotation % 360, pg.analysis_width, pg.analysis_height)
+                raw = _box_transform(displayed, -pg.rotation % 360, pg.width, pg.height)
+                box = tuple(round(max(0, v) * pg.unit, 6) for v in raw)
                 if box[0] >= box[2] or box[1] >= box[3]:
                     raise _fail("PDF_INVALID")
-                locations.append(PdfSourceLocation(physical_page, label, box))
-            blocks.append(("\n".join(line.text for line in group), level, tuple(locations)))
-    return blocks, warnings, count, len(lines)
+                locations.append(PdfSourceLocation(pg.physical_page, pg.label, box))
+            blocks.append((_join_paragraph_lines(group, is_heading=(level is not None)), level, tuple(locations)))
+    return blocks
 
 
 def read_pdf(data: bytes, document_id: str, version_id: str, *, first_page_only: bool = False) -> ParsedDocument:
@@ -429,6 +573,7 @@ def read_pdf(data: bytes, document_id: str, version_id: str, *, first_page_only:
     active_sections: list[Section] = []
     blocks: list[ContentBlock] = []
     warnings: list[ParseWarning] = []
+    extracted_pages: list[_ExtractedPage] = []
     total_glyphs = total_lines = total_text = 0
     physical_page = 0
     try:
@@ -459,31 +604,15 @@ def read_pdf(data: bytes, document_id: str, version_id: str, *, first_page_only:
                     warnings.append(ParseWarning("PDF_PAGE_LABELS_INVALID", "Unreliable page label omitted.", physical_page))
                     label = None
                 try:
-                    extracted, page_warnings, glyph_count, line_count = _page_blocks(page, label or None)
+                    pg_data, glyph_count, line_count = _extract_page_raw(page, label or None)
                 finally:
                     page.close()
-                warnings.extend(page_warnings)
+                warnings.extend(pg_data.warnings)
                 total_glyphs += glyph_count
                 total_lines += line_count
-                total_text += sum(len(text) for text, _, _ in extracted)
-                if (total_glyphs > MAX_DOCUMENT_GLYPHS or total_lines > MAX_DOCUMENT_LINES
-                        or total_text > MAX_DOCUMENT_TEXT):
+                if total_glyphs > MAX_DOCUMENT_GLYPHS or total_lines > MAX_DOCUMENT_LINES:
                     raise _fail("PDF_RESOURCE_LIMIT")
-
-                for sequence, (text, level, locations) in enumerate(extracted, 1):
-                    block_id = f"{version_id}:pdf:{physical_page}:{sequence}"
-                    if level is not None:
-                        while active_sections and active_sections[-1].level >= level:
-                            active_sections.pop()
-                        parent = active_sections[-1].heading_block_id if active_sections else None
-                        section = Section(text, level, block_id, parent)
-                        sections.append(section)
-                        active_sections.append(section)
-                    blocks.append(ContentBlock(
-                        block_id, version_id, "heading" if level is not None else "paragraph", text, locations,
-                        active_sections[-1].heading_block_id if active_sections else None,
-                        tuple(section.title for section in active_sections),
-                    ))
+                extracted_pages.append(pg_data)
                 if first_page_only:
                     break
     except (PdfminerException, PDFException, PDFSyntaxError, PSSyntaxError, TypeError, ValueError) as error:
@@ -495,6 +624,8 @@ def read_pdf(data: bytes, document_id: str, version_id: str, *, first_page_only:
         raise _fail("PDF_INVALID") from None
     if physical_page == 0 or (not first_page_only and physical_page != page_count):
         raise _fail("PDF_INVALID")
+
+    # Full-book OCR fallback only for predominantly scanned PDFs
     if (
         not first_page_only
         and sys.platform == "darwin"
@@ -506,4 +637,52 @@ def read_pdf(data: bytes, document_id: str, version_id: str, *, first_page_only:
         ocr_result = ocr_scanned_pdf(data, version_id, page_count, labels, warnings)
         if ocr_result is not None and ocr_result[1]:
             sections, blocks, warnings = ocr_result
+            return ParsedDocument(document_id, version_id, "pdf", tuple(sections), tuple(blocks), tuple(warnings))
+
+    # Selective page-level OCR for sparse scanned insert pages inside digital PDFs (1..12 pages max)
+    insert_ocr_map: dict[int, list[PageBlock]] = {}
+    if not first_page_only and sys.platform == "darwin" and page_count >= 2:
+        sparse_scan_pages = [
+            pg.physical_page
+            for pg in extracted_pages
+            if pg.chars_count < 30 and any(w.code == "PDF_SUSPECTED_SCAN" for w in pg.warnings)
+        ]
+        if 1 <= len(sparse_scan_pages) <= 12:
+            from app.parsing.darwin_ocr import ocr_selected_pages
+
+            ocr_pages = ocr_selected_pages(data, sparse_scan_pages)
+            for pno, (_pw, _ph, raw_lines) in ocr_pages.items():
+                if not raw_lines:
+                    continue
+                pg_obj = extracted_pages[pno - 1]
+                sorted_l = sorted(raw_lines, key=lambda it: (round(it[1][1] / 6.0), it[1][0]))
+                text_joined = "\n".join(t for t, _ in sorted_l)
+                locs = tuple(PdfSourceLocation(pno, pg_obj.label, box) for _, box in sorted_l)
+                insert_ocr_map[pno] = [(text_joined, None, locs)]
+                warnings.append(ParseWarning("PDF_PAGE_OCR_USED", "Scanned insert page was extracted via local OCR.", pno))
+
+    running_edges = _detect_running_headers(extracted_pages)
+    multi_page = len(extracted_pages) >= 4
+    for pg in extracted_pages:
+        if pg.physical_page in insert_ocr_map:
+            page_blocks = insert_ocr_map[pg.physical_page]
+        else:
+            page_blocks = _build_page_blocks(pg, running_edges, multi_page)
+        total_text += sum(len(text) for text, _, _ in page_blocks)
+        if total_text > MAX_DOCUMENT_TEXT:
+            raise _fail("PDF_RESOURCE_LIMIT")
+        for sequence, (text, level, locations) in enumerate(page_blocks, 1):
+            block_id = f"{version_id}:pdf:{pg.physical_page}:{sequence}"
+            if level is not None:
+                while active_sections and active_sections[-1].level >= level:
+                    active_sections.pop()
+                parent = active_sections[-1].heading_block_id if active_sections else None
+                section = Section(text, level, block_id, parent)
+                sections.append(section)
+                active_sections.append(section)
+            blocks.append(ContentBlock(
+                block_id, version_id, "heading" if level is not None else "paragraph", text, locations,
+                active_sections[-1].heading_block_id if active_sections else None,
+                tuple(section.title for section in active_sections),
+            ))
     return ParsedDocument(document_id, version_id, "pdf", tuple(sections), tuple(blocks), tuple(warnings))

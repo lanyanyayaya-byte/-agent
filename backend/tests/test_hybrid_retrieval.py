@@ -336,11 +336,13 @@ async def test_empty_invalid_and_comparison_limit(library):
     for options in (
         {"retrieval_mode": "invalid"}, {"coverage_mode": "invalid"}, {"top_k": True}, {"top_k": 51},
         {"document_ids": "invalid"}, {"chunk_set_ids": [0]}, {"chunk_set_ids": [2**63]},
-        {"coverage_mode": "per_document"}, {"coverage_mode": "per_document", "document_ids": list("abcdefghi")},
         {"query_vector": axis()},
     ):
         with pytest.raises(ValueError):
             await service.search("无匹配", **({"retrieval_mode": "keyword"} | options))
+    # P10.2: per_document comparison across 9+ books must NOT crash with a hard 8-book ValueError
+    many_compare = await service.search("暂无索引", retrieval_mode="keyword", coverage_mode="per_document")
+    assert many_compare.coverage_mode == "per_document" and len(many_compare.documents) == 9
     for query in ("", " ", "\x00", "\ud800", "a" * 257, None):
         with pytest.raises(ValueError):
             await service.search(query, retrieval_mode="keyword")

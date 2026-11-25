@@ -2,16 +2,32 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   parseRunEvent,
   type ArtifactSummary,
+  type CandidateTraceView,
+  type DocumentTraceView,
   type ParseWarning,
+  type RetrievalTraceData,
+  type RetrievalTraceSummary,
   type RunEvent,
+  type StageTraceView,
   type StoredCitation,
   type ToolCategory,
 } from './chatEvents';
 import { readSse } from './sse';
 
-export type { ArtifactSummary, ParseWarning, StoredCitation, ToolCategory };
+export type {
+  ArtifactSummary,
+  CandidateTraceView,
+  DocumentTraceView,
+  ParseWarning,
+  RetrievalTraceData,
+  RetrievalTraceSummary,
+  StageTraceView,
+  StoredCitation,
+  ToolCategory,
+};
 export type RetrievalMode = 'keyword' | 'vector' | 'hybrid';
 export type CoverageMode = 'global' | 'per_document';
+export type RetrievalStrategy = 'auto' | 'global' | 'scoped' | 'compare' | 'book_summary';
 export type ChannelStatus = 'hybrid' | 'keyword_only' | 'vector_only' | 'partial' | 'unavailable';
 export type EvidenceStatus = 'evidence' | 'no_evidence' | 'not_returned' | 'not_assessed' | 'unavailable';
 
@@ -44,6 +60,9 @@ export type KnowledgeSearchHit = {
   text_fidelity: string;
   body_text: string;
   fusion_score: number;
+  rerank_score?: number | null;
+  rerank_rank?: number | null;
+  is_neighbor_expansion?: boolean;
   channel_ranks: ChannelRank[];
   keyword_matched_in: ('body' | 'title')[];
 };
@@ -68,12 +87,17 @@ export type KnowledgeSearchResponse = {
   hits: KnowledgeSearchHit[];
   documents: DocumentCoverageView[];
   diagnostic: { code: string; message: string } | null;
+  actual_strategy?: RetrievalStrategy;
+  rerank_used?: boolean;
+  rerank_diagnostic?: { code: string; message: string } | null;
+  trace?: RetrievalTraceData | null;
   timings: {
     scope_ms: number;
     fts_ms: number;
     vector_ms: number;
     query_embedding_ms: number;
     fusion_ms: number;
+    rerank_ms?: number;
     source_ms: number;
   };
 };
@@ -83,7 +107,171 @@ export type KnowledgeQueryOptions = {
   document_ids?: string[] | null;
   retrieval_mode?: RetrievalMode;
   coverage_mode?: CoverageMode;
+  strategy?: RetrievalStrategy;
   top_k?: number;
+};
+
+export type KnowledgeSettings = {
+  auto_index_on_import: boolean;
+  cloud_embedding_enabled: boolean;
+  cloud_rerank_enabled: boolean;
+  enable_bilingual_rewrite: boolean;
+  default_top_k: number;
+  compare_top_k: number;
+  rerank_candidates: number;
+  min_vector_similarity: number;
+};
+
+export type IndexJobBrief = {
+  job_id: string;
+  job_type: string;
+  status: IndexJobStatus;
+  stage: IndexJobStage;
+  completed_work: number;
+  total_work: number | null;
+  error_code: string | null;
+  error_message: string | null;
+  retry_count: number;
+  next_retry_at: number | null;
+  cancel_requested_at: number | null;
+};
+
+export type DocumentIndexStatus = {
+  document_id: string;
+  name: string;
+  format: 'pdf' | 'docx' | 'md';
+  version_id: string;
+  version_count: number;
+  latest_size_bytes: number | null;
+  created_at: string;
+  updated_at: string;
+  parse_status: 'pending' | 'writing' | 'ready' | 'failed';
+  page_count: number | null;
+  parsed_pages: number | null;
+  chunk_count: number | null;
+  keyword_status: 'pending' | 'ready' | 'unsearchable';
+  embedding_status: 'pending' | 'running' | 'waiting_key' | 'disabled' | 'partial' | 'ready' | 'failed' | 'unsearchable';
+  embedded_count: number;
+  vector_coverage_pct: number | null;
+  vector_searchable: boolean;
+  embedding_model: string | null;
+  embedding_dimension: number | null;
+  published_readiness: PublishedIndexReadiness | null;
+  latest_job: IndexJobBrief | null;
+  last_indexed_at: string | null;
+  warnings_count: number;
+  parse_spec_current?: boolean;
+  chunker_current?: boolean;
+  needs_rebuild?: boolean;
+  stale_reason?: string | null;
+};
+
+export type KnowledgeIndexOverview = {
+  total_documents: number;
+  ready_hybrid: number;
+  ready_keyword: number;
+  in_progress: number;
+  pending: number;
+  failed: number;
+  unsearchable: number;
+  missing_for_completion: number;
+  active_job_id: string | null;
+  settings: KnowledgeSettings;
+  siliconflow_configured: boolean;
+  documents: DocumentIndexStatus[];
+  stale_count?: number;
+};
+
+export type RewriteMode = 'off' | 'rules' | 'llm';
+
+export type DebugSearchParams = {
+  query: string;
+  document_ids?: string[] | null;
+  strategy?: RetrievalStrategy;
+  mode?: RetrievalMode;
+  coverage_mode?: CoverageMode | null;
+  rerank?: boolean;
+  rewrite?: RewriteMode;
+  top_k?: number;
+  candidate_k?: number;
+  min_vector_similarity?: number;
+  exact_phrase?: boolean;
+  expand_neighbors?: boolean;
+};
+
+export type ChunkSectionSummary = {
+  section_path: string[];
+  title: string;
+  chunk_count: number;
+  first_chunk_index: number;
+  page_start: number | null;
+  page_end: number | null;
+};
+
+export type ChunkBrowserItem = {
+  chunk_id: string;
+  chunk_index: number;
+  text: string;
+  char_count: number;
+  section_path: string[];
+  title_context: string[];
+  physical_pages: number[];
+  page_labels: string[];
+  location_summary: string;
+  embedded: boolean;
+  warnings: ParseWarning[];
+  has_prev: boolean;
+  has_next: boolean;
+};
+
+export type ChunkBrowserResponse = {
+  document_id: string;
+  textbook_name: string;
+  format: 'pdf' | 'docx' | 'md';
+  document_version_id: string;
+  content_sha256: string;
+  parsed_document_id: number | null;
+  chunk_set_id: number | null;
+  parser_version: string | null;
+  chunker_version: string | null;
+  parse_spec_current: boolean;
+  chunker_current: boolean;
+  total_chunks: number;
+  filtered_total: number;
+  offset: number;
+  limit: number;
+  pages: number[];
+  sections: ChunkSectionSummary[];
+  chunks: ChunkBrowserItem[];
+};
+
+export type ChunkNeighborsResponse = {
+  document_id: string;
+  chunk_set_id: number;
+  center_index: number;
+  previous: ChunkBrowserItem | null;
+  current: ChunkBrowserItem | null;
+  next: ChunkBrowserItem | null;
+};
+
+export type BatchIndexResult = {
+  queued_count: number;
+  skipped_complete: number;
+  skipped_active: number;
+  mode: 'hybrid' | 'local_only';
+  queued_document_ids: string[];
+};
+
+export type BatchImportItem = {
+  filename: string;
+  ok: boolean;
+  result?: {
+    import_id: string;
+    document_id: string;
+    document_version_id: string;
+    outcome: 'imported' | 'duplicate' | 'updated' | 'unchanged';
+  };
+  error_code?: string;
 };
 
 export type McpRunOptions = {
@@ -464,6 +652,7 @@ export type RunSummary = Omit<RunStatus, 'pending_approval'> & {
   citations?: StoredCitation[];
   artifacts?: StoredArtifact[];
   skill_activations?: StoredSkillActivation[];
+  retrieval_trace_summary?: RetrievalTraceSummary | null;
 };
 type RunPage = { items: RunSummary[]; next_cursor: string | null };
 type CancelResult =
@@ -624,6 +813,12 @@ export function deleteWorkspaceFile(sessionId: string, fileId: string): Promise<
 export function openArtifact(sessionId: string, artifactId: string): Promise<void> {
   return invoke<void>('open_artifact', {
     request: { session_id: sessionId, artifact_id: artifactId },
+  });
+}
+
+export function openTextbookOriginal(sha256: string, filename: string): Promise<void> {
+  return invoke<void>('open_textbook_original', {
+    request: { sha256, filename },
   });
 }
 
@@ -854,6 +1049,9 @@ export async function connectApiClient() {
         document_ids?: string[] | null;
         retrieval_mode?: RetrievalMode;
         coverage_mode?: CoverageMode;
+        strategy?: RetrievalStrategy;
+        use_rerank?: boolean;
+        rewrite_mode?: 'auto' | 'off';
       },
       signal: AbortSignal,
     ): Promise<KnowledgeSearchResponse> {
@@ -861,6 +1059,51 @@ export async function connectApiClient() {
         AbortSignal.any([signal, AbortSignal.timeout(30000)]), { body: params });
       await requireSuccess(response);
       return await response.json();
+    },
+    async debugSearchKnowledge(
+      params: DebugSearchParams,
+      signal: AbortSignal,
+    ): Promise<KnowledgeSearchResponse> {
+      const response = await request('/knowledge/debug-search', 'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(45000)]), { body: params });
+      await requireSuccess(response);
+      return await response.json();
+    },
+    browseDocumentChunks(
+      documentId: string,
+      params: { page?: number; section?: string; q?: string; offset?: number; limit?: number },
+      signal: AbortSignal,
+    ): Promise<ChunkBrowserResponse> {
+      const qs = new URLSearchParams();
+      if (params.page !== undefined) qs.set('page', String(params.page));
+      if (params.section) qs.set('section', params.section);
+      if (params.q) qs.set('q', params.q);
+      if (params.offset !== undefined) qs.set('offset', String(params.offset));
+      if (params.limit !== undefined) qs.set('limit', String(params.limit));
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return readJson(`/knowledge/documents/${encodeURIComponent(documentId)}/chunks${suffix}`, signal);
+    },
+    getChunkNeighbors(
+      documentId: string,
+      chunkIndex: number,
+      signal: AbortSignal,
+    ): Promise<ChunkNeighborsResponse> {
+      return readJson(
+        `/knowledge/documents/${encodeURIComponent(documentId)}/chunks/${chunkIndex}/neighbors`,
+        signal,
+      );
+    },
+    async rebuildStaleIndexes(signal: AbortSignal): Promise<BatchIndexResult> {
+      const response = await request('/knowledge/rebuild-stale', 'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(10000)]));
+      await requireSuccess(response);
+      return await response.json();
+    },
+    getRunRetrievalTrace(
+      runId: string,
+      signal: AbortSignal,
+    ): Promise<{ run_id: string; trace: RetrievalTraceData | null }> {
+      return readJson(`/runs/${encodeURIComponent(runId)}/retrieval-trace`, signal);
     },
     listSessions(signal: AbortSignal): Promise<SessionSummary[]> {
       return readJson('/sessions', signal);
@@ -877,6 +1120,53 @@ export async function connectApiClient() {
     },
     listDocuments(signal: AbortSignal): Promise<DocumentSummary[]> {
       return readJson('/knowledge/documents', signal);
+    },
+    getKnowledgeIndexStatus(signal: AbortSignal): Promise<KnowledgeIndexOverview> {
+      return readJson('/knowledge/index-status', signal);
+    },
+    getKnowledgeSettings(signal: AbortSignal): Promise<KnowledgeSettings> {
+      return readJson('/knowledge/settings', signal);
+    },
+    async updateKnowledgeSettings(
+      patch: Partial<KnowledgeSettings>,
+      signal: AbortSignal,
+    ): Promise<KnowledgeSettings> {
+      const response = await request('/knowledge/settings', 'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(5000)]), { body: patch });
+      await requireSuccess(response);
+      return await response.json();
+    },
+    async indexAllDocuments(signal: AbortSignal): Promise<BatchIndexResult> {
+      const response = await request('/knowledge/index-all', 'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(15000)]));
+      await requireSuccess(response);
+      return await response.json();
+    },
+    async rebuildDocumentIndex(
+      documentId: string,
+      forceRebuild: boolean,
+      signal: AbortSignal,
+    ): Promise<IndexJobBrief | null> {
+      const response = await request(
+        `/knowledge/documents/${encodeURIComponent(documentId)}/rebuild-index`,
+        'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+        { body: { force_rebuild: forceRebuild } },
+      );
+      await requireSuccess(response);
+      return await response.json();
+    },
+    async cancelDocumentIndexJob(
+      documentId: string,
+      signal: AbortSignal,
+    ): Promise<IndexJobBrief | null> {
+      const response = await request(
+        `/knowledge/documents/${encodeURIComponent(documentId)}/cancel-index`,
+        'POST',
+        AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+      );
+      await requireSuccess(response);
+      return await response.json();
     },
     listMcpServers(signal: AbortSignal): Promise<McpServerView[]> {
       return readJson('/mcp/servers', signal);

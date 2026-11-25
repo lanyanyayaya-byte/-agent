@@ -1,15 +1,20 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ApiRequestError,
   type ApiClient,
-  type CoverageMode,
+  type BatchImportItem,
   type DocumentDetails,
-  type DocumentSummary,
-  type KnowledgeSearchResponse,
-  type RetrievalMode,
+  type DocumentIndexStatus,
+  type IndexJobStage,
+  type KnowledgeIndexOverview,
+  type KnowledgeSettings,
 } from './api/apiClient';
+import ChunkBrowser from './ChunkBrowser';
+import RetrievalLab from './RetrievalLab';
 import TextbookIndex from './TextbookIndex';
+
+type LibraryTab = 'manage' | 'lab' | 'chunks';
 
 type ImportRequest = { action: 'select'; document_id?: string } | { action: 'retry'; import_id: string };
 type ImportOutcome = 'imported' | 'duplicate' | 'updated' | 'unchanged';
@@ -21,15 +26,23 @@ type ImportResult = {
 };
 
 const outcomes: Record<ImportOutcome, string> = {
-  imported: '教材已导入。',
+  imported: '教材已导入，已加入后台自动索引队列。',
   duplicate: '此文件内容已在教材库中，未新增教材。',
-  updated: '教材已更新，新增一个版本。',
+  updated: '教材已更新，新增一个版本并已加入自动索引队列。',
   unchanged: '文件内容与最新版本相同，未新增版本。',
 };
 const formats = { pdf: 'PDF', docx: 'DOCX', md: 'Markdown' };
 const statuses = { imported: '已导入' };
+const stageLabels: Record<IndexJobStage, string> = {
+  parsing: '解析中',
+  chunking: '分块中',
+  keyword_indexing: 'BM25索引',
+  embedding: '向量化中',
+  publishing: '发布索引',
+};
 const dateTime = new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' });
 const number = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
+const ACTIVE_OVERVIEW_POLL_MS = 2500;
 
 function fileSize(bytes: number | null) {
   if (bytes === null) return '—';
@@ -72,6 +85,81 @@ function errorMessage(error: unknown, fallback: string) {
   }
 }
 
+function isJobActive(doc: DocumentIndexStatus) {
+  const st = doc.latest_job?.status;
+  return st === 'queued' || st === 'running' || st === 'retry_wait';
+}
+
+function getRowOverallBadge(doc: DocumentIndexStatus): { label: string; tone: 'ready' | 'keyword' | 'running' | 'failed' | 'pending' | 'muted' } {
+  if (isJobActive(doc)) {
+    const stage = doc.latest_job ? stageLabels[doc.latest_job.stage] : '处理中';
+    if (doc.latest_job?.status === 'retry_wait') {
+      return { label: `等待重试 · ${stage}`, tone: 'running' };
+    }
+    return { label: `索引中 · ${stage}`, tone: 'running' };
+  }
+  if (doc.latest_job?.status === 'failed' && doc.published_readiness !== 'ready_hybrid') {
+    return { label: '索引失败', tone: 'failed' };
+  }
+  if (doc.published_readiness === 'ready_hybrid') {
+    return { label: '混合就绪', tone: 'ready' };
+  }
+  if (doc.published_readiness === 'ready_keyword') {
+    return { label: '仅关键词', tone: 'keyword' };
+  }
+  if (doc.published_readiness === 'unsearchable') {
+    return { label: '无正文', tone: 'muted' };
+  }
+  return { label: '未索引', tone: 'pending' };
+}
+
+function getParseLabel(doc: DocumentIndexStatus) {
+  if (doc.parse_status === 'ready') {
+    if (doc.page_count !== null && doc.page_count > 0) {
+      return `已解析 · ${doc.page_count} 页`;
+    }
+    return '已解析';
+  }
+  if (doc.parse_status === 'writing') return '解析中';
+  if (doc.parse_status === 'failed') return '解析失败';
+  return '未解析';
+}
+
+function getJobDiagnosticText(doc: DocumentIndexStatus) {
+  const job = doc.latest_job;
+  if (job) {
+    if (job.status === 'running' || job.status === 'queued' || job.status === 'retry_wait') {
+      const stage = stageLabels[job.stage] ?? job.stage;
+      if (job.total_work !== null && job.total_work > 0) {
+        return `${stage} (${job.completed_work}/${job.total_work})`;
+      }
+      return job.status === 'queued' ? `排队中 · ${stage}` : `${stage}…`;
+    }
+    if (job.status === 'failed') {
+      return job.error_message || job.error_code || '任务失败';
+    }
+    if (job.status === 'cancelled') {
+      return '已取消';
+    }
+  }
+  if (doc.embedding_status === 'waiting_key') {
+    return '等待配置 SiliconFlow Key';
+  }
+  if (doc.embedding_status === 'disabled') {
+    return '未开启云端向量化';
+  }
+  if (doc.embedding_status === 'partial') {
+    return `部分向量化 (${doc.embedded_count}/${doc.chunk_count ?? 0})`;
+  }
+  if (doc.published_readiness === 'ready_hybrid') {
+    return doc.embedding_model ? `BGE-M3 · ${doc.embedding_dimension ?? 1024}d` : '混合检索就绪';
+  }
+  if (doc.published_readiness === 'unsearchable') {
+    return '无可用文本层';
+  }
+  return '待索引';
+}
+
 function DateTime({ value }: { value: string }) {
   return <time dateTime={value}>{dateTime.format(new Date(value))}</time>;
 }
@@ -79,38 +167,86 @@ function DateTime({ value }: { value: string }) {
 export default function LibraryPanel({
   client, active, siliconflowConfigured = false,
 }: { client?: ApiClient; active: boolean; siliconflowConfigured?: boolean }) {
-  const [items, setItems] = useState<DocumentSummary[]>();
+  const [overview, setOverview] = useState<KnowledgeIndexOverview>();
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [selectedId, setSelectedId] = useState<string>();
-  const [confirmDelete, setConfirmDelete] = useState<DocumentSummary>();
+  const [confirmDelete, setConfirmDelete] = useState<DocumentIndexStatus>();
   const [pending, setPending] = useState('');
+  const [rowBusyId, setRowBusyId] = useState<string>();
   const [notice, setNotice] = useState('');
   const [actionError, setActionError] = useState('');
   const [retryId, setRetryId] = useState<string>();
+  const [confirmCloudEnable, setConfirmCloudEnable] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [activeTab, setActiveTab] = useState<LibraryTab>('manage');
+  const [chunkTarget, setChunkTarget] = useState<{ documentId?: string; page?: number }>({});
+
+  const loadOverview = useCallback(async (source: ApiClient, signal: AbortSignal, silent: boolean) => {
+    if (!silent) {
+      setLoading(true);
+      setLoadError('');
+    }
+    try {
+      const next = await source.getKnowledgeIndexStatus(signal);
+      if (signal.aborted) return;
+      setOverview(next);
+      setSelectedId((current) => next.documents.some((doc) => doc.document_id === current) ? current : undefined);
+      setLoadError('');
+    } catch (error) {
+      if (signal.aborted) return;
+      if (!silent) {
+        setLoadError(errorMessage(error, '无法加载教材列表，请检查后端连接或刷新列表。'));
+      }
+    } finally {
+      if (!signal.aborted && !silent) {
+        setLoading(false);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     if (!client || !active) return;
     const controller = new AbortController();
-    setLoading(true);
-    setLoadError('');
-    void client.listDocuments(controller.signal).then((documents) => {
-      if (controller.signal.aborted) return;
-      setItems(documents);
-      setSelectedId((current) => documents.some((document) => document.document_id === current) ? current : undefined);
-      setLoading(false);
-    }).catch((error) => {
-      if (controller.signal.aborted) return;
-      setLoadError(errorMessage(error, '无法加载教材列表，请检查后端连接或刷新列表。'));
-      setLoading(false);
-    });
+    void loadOverview(client, controller.signal, false);
     return () => controller.abort();
-  }, [active, client, revision]);
+  }, [active, client, loadOverview, revision]);
+
+  const hasActiveJobs = !!overview && (overview.in_progress > 0 || overview.active_job_id !== null);
+
+  useEffect(() => {
+    if (!client || !active || !hasActiveJobs) return;
+    const controller = new AbortController();
+    const timer = setInterval(() => {
+      void loadOverview(client, controller.signal, true);
+    }, ACTIVE_OVERVIEW_POLL_MS);
+    return () => {
+      clearInterval(timer);
+      controller.abort();
+    };
+  }, [active, client, hasActiveJobs, loadOverview]);
 
   const refresh = useCallback(() => {
     setRevision((value) => value + 1);
   }, []);
+
+  async function updateSettings(patch: Partial<KnowledgeSettings>, successText?: string) {
+    if (!client || savingSettings) return;
+    setSavingSettings(true);
+    setActionError('');
+    try {
+      const updated = await client.updateKnowledgeSettings(patch, new AbortController().signal);
+      setOverview((prev) => prev ? { ...prev, settings: updated } : prev);
+      setConfirmCloudEnable(false);
+      if (successText) setNotice(successText);
+      refresh();
+    } catch (error) {
+      setActionError(errorMessage(error, '无法保存知识库索引设置，请稍后重试。'));
+    } finally {
+      setSavingSettings(false);
+    }
+  }
 
   async function importDocument(request: ImportRequest) {
     if (!client || pending) return;
@@ -135,14 +271,117 @@ export default function LibraryPanel({
     }
   }
 
-  async function deleteDocument(document: DocumentSummary) {
+  async function importMultipleDocuments() {
+    if (!client || pending) return;
+    setNotice('');
+    setActionError('');
+    setPending('正在批量导入教材…');
+    try {
+      const items = await invoke<BatchImportItem[] | null>('select_and_import_documents');
+      if (!items || items.length === 0) return;
+      const imported = items.filter((item) => item.ok && item.result?.outcome === 'imported').length;
+      const duplicates = items.filter((item) => item.ok && item.result?.outcome === 'duplicate').length;
+      const failed = items.filter((item) => !item.ok);
+      const parts = [`批量导入完成：新增 ${imported} 本`];
+      if (duplicates > 0) parts.push(`重复跳过 ${duplicates} 本`);
+      if (failed.length > 0) parts.push(`失败 ${failed.length} 本`);
+      setNotice(`${parts.join('，')}。`);
+      if (failed.length > 0) {
+        const failedNames = failed.slice(0, 3).map((f) => f.filename).join('、');
+        setActionError(`部分文件导入失败：${failedNames}${failed.length > 3 ? ' 等' : ''}。`);
+      }
+      refresh();
+    } catch (error) {
+      if (errorCode(error) !== 'IMPORT_CANCELLED') {
+        setActionError(errorMessage(error, '无法完成批量导入，请检查文件和后端连接后重试。'));
+      }
+    } finally {
+      setPending('');
+    }
+  }
+
+  async function handleIndexAll() {
+    if (!client || pending) return;
+    setNotice('');
+    setActionError('');
+    setPending('正在提交补全索引队列…');
+    try {
+      const result = await client.indexAllDocuments(new AbortController().signal);
+      if (result.queued_count === 0) {
+        setNotice(`所有教材索引均已完整或在队列中（跳过已完整 ${result.skipped_complete} 本）。`);
+      } else {
+        const modeText = result.mode === 'hybrid' ? '混合向量索引' : '本地关键词索引';
+        setNotice(`已加入${modeText}队列 ${result.queued_count} 本（跳过已就绪 ${result.skipped_complete} 本）。`);
+      }
+      refresh();
+    } catch (error) {
+      setActionError(errorMessage(error, '无法提交一键补全索引，请检查后端状态后重试。'));
+    } finally {
+      setPending('');
+    }
+  }
+
+  async function handleRebuildStale() {
+    if (!client || pending) return;
+    setNotice('');
+    setActionError('');
+    setPending('正在提交待升级教材重建队列…');
+    try {
+      const result = await client.rebuildStaleIndexes(new AbortController().signal);
+      if (result.queued_count === 0) {
+        setNotice('当前没有需要升级解析/切片版本的教材。');
+      } else {
+        setNotice(`已加入升级重建队列 ${result.queued_count} 本（未变化切片的向量将自动复用缓存）。`);
+      }
+      refresh();
+    } catch (error) {
+      setActionError(errorMessage(error, '无法提交待升级教材重建，请检查后端状态后重试。'));
+    } finally {
+      setPending('');
+    }
+  }
+
+  function handleInspectChunk(documentId: string, page?: number) {
+    setChunkTarget({ documentId, page });
+    setActiveTab('chunks');
+  }
+
+  async function handleRowIndexAction(doc: DocumentIndexStatus, action: 'rebuild' | 'cancel') {
+    if (!client || rowBusyId) return;
+    setNotice('');
+    setActionError('');
+    setRowBusyId(doc.document_id);
+    try {
+      if (action === 'cancel') {
+        await client.cancelDocumentIndexJob(doc.document_id, new AbortController().signal);
+        setNotice(`已请求取消《${doc.name}》的索引任务。`);
+      } else {
+        const forceRebuild = doc.published_readiness === 'ready_hybrid';
+        await client.rebuildDocumentIndex(doc.document_id, forceRebuild, new AbortController().signal);
+        setNotice(forceRebuild ? `已将《${doc.name}》加入重建索引队列。` : `已将《${doc.name}》加入补全索引队列。`);
+      }
+      refresh();
+    } catch (error) {
+      setActionError(errorMessage(error, `无法更新《${doc.name}》的索引任务，请稍后重试。`));
+    } finally {
+      setRowBusyId(undefined);
+    }
+  }
+
+  async function deleteDocument(document: DocumentIndexStatus) {
     if (!client || pending) return;
     setNotice('');
     setActionError('');
     setPending('正在删除教材…');
     try {
       await client.deleteDocument(document.document_id, new AbortController().signal);
-      setItems((previous) => previous?.filter((item) => item.document_id !== document.document_id));
+      setOverview((previous) => previous
+        ? {
+          ...previous,
+          total_documents: Math.max(0, previous.total_documents - 1),
+          documents: previous.documents.filter((item) => item.document_id !== document.document_id),
+        }
+        : previous);
       setSelectedId((previous) => previous === document.document_id ? undefined : previous);
       setConfirmDelete(undefined);
       setNotice('教材已删除。');
@@ -154,6 +393,11 @@ export default function LibraryPanel({
     }
   }
 
+  const items = overview?.documents;
+  const settings = overview?.settings;
+  const effectiveSfConfigured = overview?.siliconflow_configured ?? siliconflowConfigured;
+  const missingCount = overview?.missing_for_completion ?? 0;
+  const staleCount = overview?.stale_count ?? 0;
   const busy = !!pending;
   const canChange = !!client && !busy && !confirmDelete;
   const canSelect = canChange && !retryId;
@@ -165,11 +409,180 @@ export default function LibraryPanel({
         <button type="button" className="secondary-button" disabled={!client || loading} onClick={refresh}>
           刷新列表
         </button>
+        {staleCount > 0 && (
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={!canChange || !overview}
+            onClick={() => void handleRebuildStale()}
+          >
+            重建待升级索引（{staleCount}）
+          </button>
+        )}
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={!canChange || !overview || missingCount === 0}
+          onClick={() => void handleIndexAll()}
+        >
+          {missingCount > 0 ? `一键补全索引（${missingCount}）` : '全部已索引'}
+        </button>
+        <button type="button" className="secondary-button" disabled={!canSelect} onClick={() => void importMultipleDocuments()}>
+          批量导入教材
+        </button>
         <button type="button" disabled={!canSelect} onClick={() => void importDocument({ action: 'select' })}>
           导入教材
         </button>
       </div>
-      <p className="library-hint">支持 PDF、DOCX 和 Markdown，每次选择一个文件。</p>
+
+      <div className="library-subtabs" role="tablist" aria-label="教材知识库功能切换">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'manage'}
+          className={`library-subtab ${activeTab === 'manage' ? 'active' : ''}`}
+          onClick={() => setActiveTab('manage')}
+        >
+          📚 教材管理与索引{overview ? `（${overview.total_documents}）` : ''}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'lab'}
+          className={`library-subtab ${activeTab === 'lab' ? 'active' : ''}`}
+          disabled={!client || !items?.length}
+          onClick={() => setActiveTab('lab')}
+        >
+          🔬 RAG 检索实验室
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'chunks'}
+          className={`library-subtab ${activeTab === 'chunks' ? 'active' : ''}`}
+          disabled={!client || !items?.length}
+          onClick={() => setActiveTab('chunks')}
+        >
+          🧩 Chunk 原文浏览器
+        </button>
+      </div>
+
+      {activeTab === 'lab' && client && !!items?.length && (
+        <RetrievalLab
+          client={client}
+          documents={items}
+          defaultRerank={!!settings?.cloud_rerank_enabled && !!settings?.cloud_embedding_enabled}
+          onInspectChunk={handleInspectChunk}
+        />
+      )}
+
+      {activeTab === 'chunks' && client && !!items?.length && (
+        <ChunkBrowser
+          client={client}
+          documents={items}
+          initialDocumentId={chunkTarget.documentId}
+          initialPage={chunkTarget.page}
+        />
+      )}
+
+      {activeTab === 'manage' && (
+        <>
+          <p className="library-hint">支持 PDF、DOCX 和 Markdown，导入后自动建立解析、BM25 关键词与 BGE-M3 向量索引。</p>
+
+      {overview && (
+        <div className="library-summary-grid" aria-label="知识库索引统计">
+          <div className="summary-kpi">
+            <span className="summary-kpi-label">总教材</span>
+            <strong className="summary-kpi-value">{overview.total_documents}</strong>
+          </div>
+          <div className="summary-kpi tone-ready">
+            <span className="summary-kpi-label">混合就绪</span>
+            <strong className="summary-kpi-value">{overview.ready_hybrid}</strong>
+          </div>
+          <div className="summary-kpi tone-keyword">
+            <span className="summary-kpi-label">仅关键词</span>
+            <strong className="summary-kpi-value">{overview.ready_keyword}</strong>
+          </div>
+          <div className="summary-kpi tone-running">
+            <span className="summary-kpi-label">索引中</span>
+            <strong className="summary-kpi-value">{overview.in_progress}</strong>
+          </div>
+          <div className="summary-kpi tone-pending">
+            <span className="summary-kpi-label">未索引</span>
+            <strong className="summary-kpi-value">{overview.pending}</strong>
+          </div>
+          <div className="summary-kpi tone-failed">
+            <span className="summary-kpi-label">失败</span>
+            <strong className="summary-kpi-value">{overview.failed}</strong>
+          </div>
+        </div>
+      )}
+
+      {settings && (
+        <div className="library-settings-bar" aria-label="全局索引设置">
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              checked={settings.auto_index_on_import}
+              disabled={!client || savingSettings}
+              onChange={(e) => void updateSettings({ auto_index_on_import: e.target.checked })}
+            />
+            <span>导入后自动建立索引</span>
+          </label>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              checked={settings.cloud_embedding_enabled}
+              disabled={!client || savingSettings}
+              onChange={(e) => {
+                if (e.target.checked && !settings.cloud_embedding_enabled) {
+                  setConfirmCloudEnable(true);
+                } else {
+                  setConfirmCloudEnable(false);
+                  void updateSettings({ cloud_embedding_enabled: false }, '已关闭云端自动向量化，后续仅建立本地关键词索引。');
+                }
+              }}
+            />
+            <span>允许云端向量化（BGE-M3）</span>
+          </label>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              checked={settings.cloud_rerank_enabled}
+              disabled={!client || savingSettings || !settings.cloud_embedding_enabled}
+              onChange={(e) => void updateSettings({ cloud_rerank_enabled: e.target.checked })}
+            />
+            <span>启用语义精排（BGE-Reranker-v2-M3）</span>
+          </label>
+          {!effectiveSfConfigured && (
+            <span className="settings-sf-hint">
+              未配置 SiliconFlow Key：当前仅建立本地 BM25 索引，配置 Key 后可一键补全向量。
+            </span>
+          )}
+        </div>
+      )}
+
+      {confirmCloudEnable && (
+        <div className="library-cloud-consent" role="group" aria-label="确认开启全局云端向量化">
+          <p>
+            开启后，新导入教材及「一键补全索引」将自动把教材分块（Chunk）文本发送至 SiliconFlow API 生成 BGE-M3 向量（原始文件不会整本上传），后续无需再逐本确认。
+          </p>
+          <div className="library-actions">
+            <button
+              type="button"
+              autoFocus
+              disabled={savingSettings}
+              onClick={() => void updateSettings({ cloud_embedding_enabled: true }, '已开启全局云端向量化授权。')}
+            >
+              确认开启云端向量化
+            </button>
+            <button type="button" className="secondary-button" disabled={savingSettings} onClick={() => setConfirmCloudEnable(false)}>
+              暂不开启
+            </button>
+          </div>
+        </div>
+      )}
+
       {!client && <p role="status">后端连接就绪后可管理教材。</p>}
       {loading && client && <p role="status">正在加载教材列表…</p>}
       {loadError && client && loadError !== actionError && <p role="alert">{loadError}</p>}
@@ -182,44 +595,125 @@ export default function LibraryPanel({
           重试本次导入
         </button>
       )}
-      {items?.length === 0 && !loading && !loadError && <p>还没有教材。点击「导入教材」添加第一份文件。</p>}
+      {items?.length === 0 && !loading && !loadError && <p>还没有教材。点击「导入教材」或「批量导入教材」添加第一份文件。</p>}
       {!!items?.length && (
         <div className="library-table">
           <table aria-label="教材列表">
             <thead>
               <tr>
-                <th scope="col">名称</th><th scope="col">格式</th><th scope="col">最新版本大小</th>
-                <th scope="col">导入时间</th><th scope="col">版本数</th><th scope="col">管理状态</th><th scope="col">操作</th>
+                <th scope="col">名称</th>
+                <th scope="col">解析状态</th>
+                <th scope="col">向量覆盖</th>
+                <th scope="col">检索状态</th>
+                <th scope="col">当前阶段 / 诊断</th>
+                <th scope="col">操作</th>
               </tr>
             </thead>
             <tbody>
-              {items.map((item) => (
-                <tr key={item.document_id}>
-                  <th scope="row"><bdi>{item.name}</bdi></th>
-                  <td>{formats[item.format]}</td>
-                  <td>{fileSize(item.latest_size_bytes)}</td>
-                  <td><DateTime value={item.created_at} /></td>
-                  <td>{item.version_count}</td>
-                  <td>{statuses[item.management_status]}</td>
-                  <td>
-                    <div className="library-actions">
-                      <button type="button" aria-label={`查看 ${item.name} 详情`} disabled={!client}
-                        aria-expanded={selectedId === item.document_id}
-                        onClick={() => setSelectedId(selectedId === item.document_id ? undefined : item.document_id)}>
-                        详情与索引
-                      </button>
-                      <button type="button" aria-label={`更新 ${item.name}`} disabled={!canSelect}
-                        onClick={() => void importDocument({ action: 'select', document_id: item.document_id })}>
-                        更新
-                      </button>
-                      <button type="button" className="library-danger" aria-label={`删除 ${item.name}`}
-                        disabled={!canChange} onClick={() => { setActionError(''); setConfirmDelete(item); }}>
-                        删除
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {items.map((item) => {
+                const badge = getRowOverallBadge(item);
+                const activeJob = isJobActive(item);
+                const rowBusy = rowBusyId === item.document_id;
+                const pct = item.vector_coverage_pct !== null ? Math.min(100, Math.max(0, Math.round(item.vector_coverage_pct))) : null;
+                return (
+                  <tr key={item.document_id}>
+                    <th scope="row">
+                      <div className="book-title-cell">
+                        <bdi>{item.name}</bdi>
+                        <span className="book-subline">
+                          {formats[item.format]} · {fileSize(item.latest_size_bytes)} · v{item.version_count}
+                          {item.needs_rebuild && (
+                            <span className="stale-upgrade-pill" title={item.stale_reason ?? '解析或切片版本已升级'}>
+                              待升级
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                    </th>
+                    <td>
+                      <span className={`parse-pill parse-${item.parse_status}`}>
+                        {getParseLabel(item)}
+                      </span>
+                    </td>
+                    <td>
+                      {item.chunk_count !== null && item.chunk_count > 0 ? (
+                        <div className="coverage-cell">
+                          <span className="coverage-numbers">
+                            {item.embedded_count} / {item.chunk_count}
+                            {pct !== null ? ` (${pct}%)` : ''}
+                          </span>
+                          <div className="coverage-bar" aria-hidden="true">
+                            <div
+                              className={`coverage-bar-fill ${pct === 100 ? 'is-full' : pct && pct > 0 ? 'is-partial' : ''}`}
+                              style={{ width: `${pct ?? 0}%` }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="coverage-empty">—</span>
+                      )}
+                    </td>
+                    <td>
+                      <div className="status-pill-group">
+                        <span className={`index-status-pill tone-${badge.tone}`}>{badge.label}</span>
+                        <span className="channel-mini-flags">
+                          <span className={`mini-flag ${item.keyword_status === 'ready' ? 'is-on' : ''}`}>
+                            BM25 {item.keyword_status === 'ready' ? '✓' : '·'}
+                          </span>
+                          <span className={`mini-flag ${item.vector_searchable ? 'is-on' : ''}`}>
+                            向量 {item.vector_searchable ? '✓' : '·'}
+                          </span>
+                        </span>
+                      </div>
+                    </td>
+                    <td className="diagnostic-cell" title={getJobDiagnosticText(item)}>
+                      <span className={item.latest_job?.status === 'failed' ? 'diag-error' : 'diag-muted'}>
+                        {getJobDiagnosticText(item)}
+                      </span>
+                    </td>
+                    <td>
+                      <div className="library-actions">
+                        {activeJob ? (
+                          <button type="button" disabled={!canChange || rowBusy}
+                            aria-label={`取消 ${item.name} 索引`}
+                            onClick={() => void handleRowIndexAction(item, 'cancel')}>
+                            取消
+                          </button>
+                        ) : (
+                          <button type="button" disabled={!canChange || rowBusy}
+                            aria-label={`${item.published_readiness === 'ready_hybrid' ? '重建' : '补全'} ${item.name} 索引`}
+                            onClick={() => void handleRowIndexAction(item, 'rebuild')}>
+                            {item.latest_job?.status === 'failed' ? '重试' : item.published_readiness === 'ready_hybrid' ? '重建' : '补全'}
+                          </button>
+                        )}
+                        {item.chunk_count !== null && item.chunk_count > 0 && (
+                          <button
+                            type="button"
+                            aria-label={`浏览 ${item.name} 切片`}
+                            disabled={!client}
+                            onClick={() => handleInspectChunk(item.document_id)}
+                          >
+                            浏览切片
+                          </button>
+                        )}
+                        <button type="button" aria-label={`查看 ${item.name} 详情`} disabled={!client}
+                          aria-expanded={selectedId === item.document_id}
+                          onClick={() => setSelectedId(selectedId === item.document_id ? undefined : item.document_id)}>
+                          详情与索引
+                        </button>
+                        <button type="button" aria-label={`更新 ${item.name}`} disabled={!canSelect}
+                          onClick={() => void importDocument({ action: 'select', document_id: item.document_id })}>
+                          更新
+                        </button>
+                        <button type="button" className="library-danger" aria-label={`删除 ${item.name}`}
+                          disabled={!canChange} onClick={() => { setActionError(''); setConfirmDelete(item); }}>
+                          删除
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -239,193 +733,9 @@ export default function LibraryPanel({
       )}
       {selectedId && (
         <LibraryDetails key={selectedId} documentId={selectedId} client={client} revision={revision}
-          active={active} blocked={!canChange} siliconflowConfigured={siliconflowConfigured} refreshLibrary={refresh} />
+          active={active} blocked={!canChange} siliconflowConfigured={effectiveSfConfigured} refreshLibrary={refresh} />
       )}
-      {!!items?.length && client && (
-        <LibrarySearchPanel client={client} documents={items} />
-      )}
-    </section>
-  );
-}
-
-const channelStatusLabels: Record<string, string> = {
-  hybrid: '混合检索（关键词 + 语义向量）',
-  keyword_only: '仅关键词检索（离线或向量未就绪降级）',
-  vector_only: '仅语义向量检索',
-  partial: '部分混合检索',
-  unavailable: '当前范围内无可用索引',
-};
-
-const evidenceStatusLabels: Record<string, string> = {
-  evidence: '已召回证据',
-  no_evidence: '未找到可靠证据',
-  not_returned: '有候选但未入围 Top-K',
-  not_assessed: '全局模式未单独评估',
-  unavailable: '索引未就绪',
-};
-
-function LibrarySearchPanel({ client, documents }: { client: ApiClient; documents: DocumentSummary[] }) {
-  const [query, setQuery] = useState('');
-  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>('hybrid');
-  const [coverageMode, setCoverageMode] = useState<CoverageMode>('global');
-  const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
-  const [searching, setSearching] = useState(false);
-  const [searchError, setSearchError] = useState('');
-  const [result, setResult] = useState<KnowledgeSearchResponse>();
-
-  function toggleDoc(docId: string) {
-    setSelectedDocs((prev) => prev.includes(docId) ? prev.filter((id) => id !== docId) : [...prev, docId]);
-  }
-
-  async function handleSearch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const trimmed = query.trim();
-    if (!trimmed || searching) return;
-    setSearching(true);
-    setSearchError('');
-    try {
-      const res = await client.searchKnowledge({
-        query: trimmed,
-        top_k: 8,
-        document_ids: selectedDocs.length > 0 ? selectedDocs : null,
-        retrieval_mode: retrievalMode,
-        coverage_mode: coverageMode,
-      }, new AbortController().signal);
-      setResult(res);
-    } catch (error) {
-      setSearchError(error instanceof ApiRequestError ? error.message : '无法完成本地教材检索，请检查索引状态后重试。');
-    } finally {
-      setSearching(false);
-    }
-  }
-
-  return (
-    <section className="library-search" aria-label="本地教材检索">
-      <div className="library-search-header">
-        <h3>本地教材检索</h3>
-        <span className="library-hint">直接检索本地已发布的关键词与向量索引，无需调用 DeepSeek，毫秒级定位原文出处。</span>
-      </div>
-      <form className="library-search-form" onSubmit={(e) => void handleSearch(e)}>
-        <div className="library-search-bar">
-          <input
-            type="search"
-            aria-label="检索教材内容"
-            placeholder="输入术语、定理、公式或自然语言问题（如：最大似然估计、MLE）"
-            maxLength={256}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <button type="submit" disabled={searching || !query.trim()}>
-            {searching ? '正在检索…' : '检索教材'}
-          </button>
-        </div>
-        <div className="library-search-options">
-          <label>
-            检索模式
-            <select aria-label="检索模式" value={retrievalMode}
-              onChange={(e) => setRetrievalMode(e.target.value as RetrievalMode)}>
-              <option value="hybrid">混合检索（FTS5 + BGE-M3）</option>
-              <option value="keyword">仅关键词检索（离线 FTS5）</option>
-              <option value="vector">仅语义向量检索</option>
-            </select>
-          </label>
-          <label>
-            召回策略
-            <select aria-label="召回策略" value={coverageMode}
-              onChange={(e) => setCoverageMode(e.target.value as CoverageMode)}>
-              <option value="global">全局相关性（Top-K）</option>
-              <option value="per_document">跨教材对比（分教材均衡配额）</option>
-            </select>
-          </label>
-        </div>
-        {documents.length > 1 && (
-          <div className="library-doc-filters" role="group" aria-label="限定检索教材范围">
-            <span className="filter-label">限定教材：</span>
-            <button type="button" className={`filter-chip ${selectedDocs.length === 0 ? 'active' : ''}`}
-              onClick={() => setSelectedDocs([])}>
-              全部（{documents.length}）
-            </button>
-            {documents.map((doc) => {
-              const active = selectedDocs.includes(doc.document_id);
-              return (
-                <button key={doc.document_id} type="button"
-                  className={`filter-chip ${active ? 'active' : ''}`}
-                  aria-pressed={active}
-                  onClick={() => toggleDoc(doc.document_id)}>
-                  <bdi>{doc.name}</bdi>
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </form>
-      {searchError && <p role="alert">{searchError}</p>}
-      {result && (
-        <div className="library-search-results" aria-live="polite">
-          <div className="search-summary-bar">
-            <span className="badge badge-channel">
-              {channelStatusLabels[result.channel_status] ?? result.channel_status}
-            </span>
-            <span>共命中 <strong>{result.hits.length}</strong> 条已核验教材证据</span>
-            <span className="search-timing">
-              耗时 {(result.timings.scope_ms + result.timings.fts_ms + result.timings.vector_ms + result.timings.fusion_ms + result.timings.source_ms).toFixed(1)} ms
-            </span>
-          </div>
-          {result.diagnostic && (
-            <p className="search-diagnostic" role="status">
-              降级提示：{result.diagnostic.message}（<code>{result.diagnostic.code}</code>）
-            </p>
-          )}
-          {result.coverage_mode === 'per_document' && result.documents.length > 0 && (
-            <div className="coverage-grid" aria-label="跨教材覆盖统计">
-              {result.documents.map((doc) => (
-                <div key={doc.document_id} className={`coverage-card status-${doc.evidence_status}`}>
-                  <strong><bdi>{doc.textbook_name ?? doc.document_id}</bdi></strong>
-                  <span>{evidenceStatusLabels[doc.evidence_status] ?? doc.evidence_status}（{doc.returned_count} 条）</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {result.hits.length === 0 ? (
-            <p className="search-empty">未检索到匹配的教材证据。请确认教材已建立索引，或尝试更换关键词。</p>
-          ) : (
-            <ol className="evidence-list" aria-label="教材检索结果">
-              {result.hits.map((hit, idx) => (
-                <li key={hit.evidence_id} className="evidence-card">
-                  <div className="evidence-header">
-                    <span className="evidence-index">证据 #{idx + 1}</span>
-                    <strong className="evidence-book"><bdi>{hit.textbook_name}</bdi></strong>
-                    <span className="badge badge-format">{formats[hit.format]}</span>
-                    <span className="badge badge-location">{hit.location_summary}</span>
-                    <span className="evidence-score">RRF {hit.fusion_score.toFixed(4)}</span>
-                  </div>
-                  {hit.section_path.length > 0 && (
-                    <div className="evidence-section">
-                      章节：{hit.section_path.join(' / ')}
-                    </div>
-                  )}
-                  {hit.warnings.length > 0 && (
-                    <div className="evidence-warnings" role="note">
-                      ⚠️ 公式与字形核验提示：{hit.warnings.map((w) => `${w.code}（${w.message}）`).join('；')}
-                      ——引用数学表达式时请核对原教材对应页。
-                    </div>
-                  )}
-                  <pre className="evidence-snippet">{hit.body_text}</pre>
-                  <div className="evidence-footer">
-                    {hit.channel_ranks.map((r) => (
-                      <span key={r.channel} className="rank-pill">
-                        {r.channel === 'keyword' ? '关键词' : '语义向量'} #{r.rank}（{r.score.toFixed(3)}）
-                      </span>
-                    ))}
-                    <span className="evidence-id-tag" title={hit.evidence_id}>
-                      已核验原件 · {hit.evidence_id.slice(0, 22)}…
-                    </span>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          )}
-        </div>
+        </>
       )}
     </section>
   );
@@ -489,12 +799,12 @@ function LibraryDetails({
                   </tr>
                 </thead>
                 <tbody>
-                  {details.versions.map((version, index) => (
-                    <tr key={version.document_version_id}>
+                  {details.versions.map((ver, index) => (
+                    <tr key={ver.document_version_id}>
                       <th scope="row">第 {index + 1} 版</th>
-                      <td className="library-hash">{version.document_version_id}<br />{version.content_sha256}</td>
-                      <td>{fileSize(version.size_bytes)}</td>
-                      <td><DateTime value={version.created_at} /></td>
+                      <td className="library-hash">{ver.document_version_id}<br />{ver.content_sha256}</td>
+                      <td>{fileSize(ver.size_bytes)}</td>
+                      <td><DateTime value={ver.created_at} /></td>
                     </tr>
                   ))}
                 </tbody>

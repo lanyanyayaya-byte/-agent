@@ -192,7 +192,8 @@ async def test_chat_rag_qa_followup_rewrite_citation_persistence_and_lifecycle(t
         assert rows(checkpoint_path, "SELECT count(*) FROM writes WHERE instr(value, ?) > 0",
                     ("寻找使观测样本出现概率最大".encode("utf-8"),)) == [(0,)]
 
-        # Turn 2: Follow-up with coreference & comparison intent ("它与 Bayesian estimation 在不同教材里怎么对比？")
+        # Turn 2: Explicit coverage_mode="global" must NOT be overridden to per_document;
+        # while strategy="auto" upgrades comparison intent to per_document + prepends "MLE" coreference.
         turn2_body = {
             **payload("它与 Bayesian estimation 在不同教材里怎么对比？"),
             "knowledge": {
@@ -200,15 +201,16 @@ async def test_chat_rag_qa_followup_rewrite_citation_persistence_and_lifecycle(t
                 "document_ids": [book_a.document_id, book_b.document_id],
                 "retrieval_mode": "keyword",
                 "coverage_mode": "global",
+                "strategy": "auto",
                 "top_k": 4,
             },
         }
         res2 = await client.post(run_path(session), json=turn2_body)
         events2 = [item async for item in frames(res2) if isinstance(item, dict)]
         cit_ev2 = next(item for item in events2 if item["type"] == "run_citations")
-        # Followup rewrite should have prepended "MLE" and upgraded coverage_mode to "per_document"
         assert "MLE" in cit_ev2["data"]["retrieval_query"]
         assert cit_ev2["data"]["coverage_mode"] == "per_document"
+        assert cit_ev2["data"]["actual_strategy"] == "compare"
 
         # Check GET /sessions/{session}/runs returns persisted tool_calls and citations
         runs_page = (await client.get(f"/api/v1/sessions/{session}/runs")).json()

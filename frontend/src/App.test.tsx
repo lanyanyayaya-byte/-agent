@@ -49,6 +49,18 @@ test('keeps the active session and SSE draft while the library is open', async (
     if (path === '/mcp/servers') return Response.json([]);
     if (path === '/skills') return Response.json([]);
     if (path === `/sessions/${sessionId}/workspace`) return Response.json({ session_id: sessionId, files: [], artifacts: [] });
+    if (path === '/knowledge/index-status') {
+      return Response.json({
+        total_documents: 0, ready_hybrid: 0, ready_keyword: 0, in_progress: 0,
+        pending: 0, failed: 0, unsearchable: 0, missing_for_completion: 0,
+        active_job_id: null, siliconflow_configured: false, documents: [],
+        settings: {
+          auto_index_on_import: true, cloud_embedding_enabled: false,
+          cloud_rerank_enabled: true, enable_bilingual_rewrite: true,
+          default_top_k: 8, compare_top_k: 12, rerank_candidates: 24, min_vector_similarity: 0.25,
+        },
+      });
+    }
     if ([`/sessions/${sessionId}/messages`, `/sessions/${sessionId}/grants`, '/knowledge/documents'].includes(path)) {
       return Response.json([]);
     }

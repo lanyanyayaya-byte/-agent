@@ -1,19 +1,22 @@
-KnowledgeAgent macOS 安装引导（v0.4.0 个人安装版）
+KnowledgeAgent macOS 安装引导（v0.5.0 个人安装版）
 ================================================
 
-一、安装与从 v0.3.0 升级步骤
-1. 若本机已有旧版 KnowledgeAgent（如 v0.3.0），请先完全退出旧版（Cmd+Q），建议先备份数据目录：
+一、安装与从 v0.4.0 升级步骤
+1. 若本机已有旧版 KnowledgeAgent（如 v0.4.0 / v0.3.0），请先完全退出旧版（Cmd+Q），建议先备份数据目录：
    ~/Library/Application Support/local.knowledgeagent.desktop
 2. 在当前挂载的磁盘映像（DMG）窗口中，将「KnowledgeAgent.app」拖入右侧的「Applications」（应用程序）文件夹（升级时选择替换）。
 3. 打开 Finder →「应用程序」（Applications），双击「KnowledgeAgent」即可启动。
-4. 首次启动会自动将业务数据库从 V6 平滑升级至 V7，完整保留已有历史会话、教材知识库、向量索引、MCP 服务配置与钥匙串中的 API Key。
-5. 启动后可在 Dock 栏右键点击「KnowledgeAgent」→「选项」→「在程序坞中保留」，固定到 Dock；确认正常启动后可在 Finder 中推出本 DMG。
+4. 首次启动会自动执行无损 Schema 迁移：
+   - 业务数据库平滑升级至 V8（新增 run_retrieval_traces 检索过程轨迹持久化）；
+   - 知识库数据库平滑升级至 V8（新增 knowledge_settings 全局索引与精排策略表）；
+   完整保留已有历史会话与消息、全部教材原件、已建立的 BM25 与向量索引、历史引用、MCP 服务配置、已安装 Skills、Workspace 与历史产物、以及钥匙串中的 DeepSeek / SiliconFlow API Key。
+5. 升级后不会删除或强制重算旧版教材索引：旧版本解析/切片索引仍可直接检索，并在教材列表显示「待升级」徽标；如需享受 PDF 解析 V3（公式符号恢复、页眉抑制、扫描插页 OCR）与 Chunk V2（消除英文断词），可随时点击「一键补全索引」或「重建待升级索引」按需升级（未变化切片自动复用 Embedding 缓存）。
+6. 启动后可在 Dock 栏右键点击「KnowledgeAgent」→「选项」→「在程序坞中保留」，固定到 Dock；确认正常启动后可在 Finder 中推出本 DMG。
 
-二、运行环境、Agent Skills 与 MCP 工具说明
-- 本应用已内置完整的 Python 3.12 运行时、MCP SDK、PyYAML、内置 Agent Skills（mind-map / word-formatting）与后端 Sidecar 组件。
-- Agent Skills 的脚本与第三方依赖在应用数据目录的独立 Runtime（runtime/venv、runtime/npm-tools）中按需准备与执行，不污染应用内置环境；可在「Skills」页面一键点击「准备基础依赖」或在各技能卡片安装对应依赖。
-- 思维导图渲染（Mermaid CLI）与第三方技能会自动识别本机已安装的 Node.js、uv、Git 与 Google Chrome，无需将庞大测试环境随安装包分发。
-- 远程 Streamable HTTP MCP 服务开箱即用；本地 stdio MCP 工具（如通过 uv tool install 安装的工具）可继续直接复用。
+二、RAG 2.0、Agent Skills 与 MCP 运行环境说明
+- 本应用已内置完整的 Python 3.12 运行时、RAG 2.0 引擎（自动索引 Worker、BGE-M3 向量检索、BGE-Reranker-v2-M3 精排、双语查询改写、检索实验室、检索追踪、Chunk 浏览器、全文与章节总结、macOS Vision OCR）、MCP SDK、PyYAML、内置 Agent Skills（mind-map / word-formatting）与后端 Sidecar 组件。
+- Agent Skills 的脚本与第三方依赖在应用数据目录的独立 Runtime（runtime/venv、runtime/npm-tools）中按需准备与执行，不污染应用内置环境。
+- 远程 Streamable HTTP MCP 服务开箱即用；本地 stdio MCP 工具可继续直接复用。
 
 三、签名声明
 - 本安装包为 Apple Silicon macOS 本地自用安装版，使用 macOS Ad-hoc 签名（signingIdentity: "-"），未执行商业 Developer ID 签名与 Apple Notary 公证。

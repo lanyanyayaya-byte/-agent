@@ -24,7 +24,7 @@ p8_stage="$desktop/target/packaging"
 variant=$route
 config="$desktop/packaging/$route.json"
 entry="$desktop/packaging/sidecar_entry.py"
-version="0.4.0"
+version="0.5.0"
 custom_version=0
 
 if [[ $# -gt 1 ]]; then
@@ -46,6 +46,7 @@ UV_PROJECT_ENVIRONMENT="$stage/build-venv" uv run --project "$backend" \
     --recursive-copy-metadata PyYAML \
     --hidden-import anyio._backends._asyncio \
     --hidden-import yaml \
+    --hidden-import app.parsing.darwin_ocr \
     --collect-data jsonschema_specifications \
     --collect-data certifi \
     --add-data "$backend/app/skills/builtin:app/skills/builtin" \

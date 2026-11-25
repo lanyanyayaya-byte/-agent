@@ -147,12 +147,20 @@ class VectorRetrievalService:
 
     async def embed_query(self, query: str, *, profile: EmbeddingProfile) -> EmbeddingBatch:
         """Use the same upload, validation, and invalidation path for every text query."""
-        validate_input(query)
+        return await self.embed_queries([query], profile=profile)
+
+    async def embed_queries(self, queries: Sequence[str], *, profile: EmbeddingProfile) -> EmbeddingBatch:
+        """Batch-embed 1..N deduplicated query variants in a single API call."""
+        clean = list(queries)
+        if not clean:
+            raise ValueError("At least one query is required.")
+        for q in clean:
+            validate_input(q)
         self.provider.check_profile(profile)
         await asyncio.to_thread(self._check_active_profile, profile.key)
         try:
             async with self.provider.open_client() as client:
-                return await self.provider.embed(client, [query], profile=profile)
+                return await self.provider.embed(client, clean, profile=profile)
         except EmbeddingError as error:
             if error.code == "EMBEDDING_REVISION_CHANGED":
                 await asyncio.to_thread(self.embeddings.invalidate_profile, profile)

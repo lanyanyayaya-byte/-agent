@@ -43,9 +43,20 @@ def library_router(require_ui, require_ready) -> APIRouter:
 
     # Host authentication runs in middleware before the route reads the request body.
     @router.post("/_host/knowledge/imports")
-    def import_textbook(body: ImportTextbook, library: Library, response: Response) -> ImportResult:
+    def import_textbook(body: ImportTextbook, library: Library, request: Request, response: Response) -> ImportResult:
         response.headers["Cache-Control"] = "no-store"
-        return library.import_textbook(body.import_id, body.filename, body.document_id)
+        result = library.import_textbook(body.import_id, body.filename, body.document_id)
+        if result.outcome in ("imported", "updated"):
+            status_svc = getattr(request.app.state, "index_status", None)
+            if status_svc is not None:
+                try:
+                    settings = status_svc.settings_store.get()
+                    if settings.auto_index_on_import:
+                        status_svc.enqueue_for_document(result.document_id, result.document_version_id)
+                except Exception as error:
+                    record("knowledge_auto_enqueue_error", document_id=result.document_id,
+                           exception_type=type(error).__name__)
+        return result
 
     @ui.get("")
     def list_textbooks(library: Library, response: Response) -> list[DocumentSummary]:

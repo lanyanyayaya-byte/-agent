@@ -14,8 +14,9 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstra
 
 from app.models import ModelError
 from app.security import ApiError
-from app.services.hybrid_retrieval import CoverageMode, MAX_COMPARISON_DOCUMENTS, RetrievalMode
+from app.services.hybrid_retrieval import CoverageMode, RetrievalMode
 from app.services.library import DOCUMENT_ID_PATTERN
+from app.services.retrieval_trace import RetrievalStrategy
 from app.services.runs import (
     KnowledgeRunConfig, McpRunConfig, RunNotCancellable, RunService, RunServiceStopping, RunStream, SkillsRunConfig,
 )
@@ -50,7 +51,8 @@ class KnowledgeQueryOptions(BaseModel):
     ] | None = None
     retrieval_mode: RetrievalMode = "hybrid"
     coverage_mode: CoverageMode = "global"
-    top_k: Annotated[int, Field(ge=1, le=20)] = 6
+    strategy: RetrievalStrategy | None = None
+    top_k: Annotated[int, Field(ge=1, le=20)] | None = None
 
 
 class McpRunOptions(BaseModel):
@@ -207,13 +209,11 @@ def chat_router(runs: RunService, store: BusinessStore, require_ui, require_read
     async def start_run(session_id: UUID, body: StartRun, request: Request) -> StreamingResponse:
         knowledge_cfg: KnowledgeRunConfig | None = None
         if body.knowledge is not None and body.knowledge.enabled:
-            if (body.knowledge.coverage_mode == "per_document" and body.knowledge.document_ids
-                    and len(set(body.knowledge.document_ids)) > MAX_COMPARISON_DOCUMENTS):
-                raise ApiError(422, "VALIDATION_ERROR", f"跨教材对比最多同时选择 {MAX_COMPARISON_DOCUMENTS} 本教材。")
             knowledge_cfg = KnowledgeRunConfig(
                 document_ids=tuple(body.knowledge.document_ids) if body.knowledge.document_ids is not None else None,
                 retrieval_mode=body.knowledge.retrieval_mode,
                 coverage_mode=body.knowledge.coverage_mode,
+                strategy=body.knowledge.strategy,
                 top_k=body.knowledge.top_k,
             )
         mcp_cfg: McpRunConfig | None = None
@@ -284,6 +284,15 @@ def run_router(runs: RunService, require_ui, require_ready) -> APIRouter:
         request.state.session_id = status.session_id
         response.headers["Cache-Control"] = "no-store"
         return status
+
+    @router.get("/{run_id}/retrieval-trace")
+    async def get_run_retrieval_trace(run_id: UUID, response: Response) -> dict:
+        try:
+            trace = await runs.get_retrieval_trace(str(run_id))
+        except RunNotFound:
+            raise ApiError(404, "NOT_FOUND", "未找到该运行。") from None
+        response.headers["Cache-Control"] = "no-store"
+        return {"run_id": str(run_id), "trace": trace}
 
     @router.post("/{run_id}/cancel")
     async def cancel_run(run_id: UUID, response: Response, request: Request) -> dict:

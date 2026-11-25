@@ -7,11 +7,17 @@ from dataclasses import dataclass
 from app.chunking.models import Chunk, ChunkerConfig, ChunkSource, ChunkSourceSpan
 from app.parsing.models import ContentBlock, DocumentParseError
 
-CHUNKER_VERSION = "1"
+CHUNKER_VERSION = "2"
 BLOCK_SEPARATOR = "\n\n"
 STRUCTURED_KINDS = {"code", "table"}
 SENTENCE_END = re.compile(r'''(?:[。！？!?；;]+|\.(?=\s|$|["'”’\)\]]))["'”’」』】）》）)\]]*''')
 TSV_MARKER = re.compile(r'["\n]')
+THEOREM_OPENER_RE = re.compile(
+    r"^(?:Theorem|Lemma|Definition|Proposition|Corollary|Proof|Remark|Example|Algorithm|"
+    r"定理|引理|定义|命题|推论|证明|注|例\s*\d|算法)\b",
+    re.I,
+)
+TINY_PROSE_THRESHOLD = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +108,35 @@ def _structured_parts(block: ContentBlock, size: int, quoted_tsv: bool) -> Itera
         yield _Part(block, start, previous_end)
 
 
+def _align_overlap_start(text: str, raw_start: int, end: int) -> int:
+    """Snap overlap start forward to a clean word or sentence boundary so English words are never cut in half."""
+    if raw_start <= 0 or raw_start >= end:
+        return raw_start
+    # If there is a clean sentence boundary in the first 45% of the overlap window, prefer starting a fresh sentence!
+    search_limit = raw_start + max(0, int((end - raw_start) * 0.45))
+    for match in SENTENCE_END.finditer(text, raw_start, search_limit):
+        cand = match.end()
+        while cand < end and text[cand].isspace():
+            cand += 1
+        if cand < end and (end - cand) >= 24:
+            return cand
+    # Otherwise never start inside an ASCII word or number
+    if text[raw_start - 1].isascii() and text[raw_start - 1].isalnum() and text[raw_start].isascii() and text[raw_start].isalnum():
+        cand = raw_start
+        while cand < end and not text[cand].isspace():
+            cand += 1
+        while cand < end and text[cand].isspace():
+            cand += 1
+        if cand < end:
+            return cand
+        return end  # single giant word; drop overlap rather than mid-word fragment
+    # Skip leading whitespace
+    cand = raw_start
+    while cand < end and text[cand].isspace():
+        cand += 1
+    return cand if cand < end else raw_start
+
+
 def _overlap_suffix(parts: list[_Part], budget: int) -> tuple[list[_Part], int]:
     suffix: list[_Part] = []
     used = 0
@@ -112,13 +147,41 @@ def _overlap_suffix(parts: list[_Part], budget: int) -> tuple[list[_Part], int]:
         length = min(part.length, budget - used - gap)
         if length <= 0:
             break
-        suffix.append(_Part(part.block, part.end - length, part.end, is_overlap=True))
-        used += gap + length
+        raw_start = part.end - length
+        aligned_start = _align_overlap_start(part.block.text, raw_start, part.end)
+        if aligned_start >= part.end:
+            continue
+        actual_len = part.end - aligned_start
+        suffix.append(_Part(part.block, aligned_start, part.end, is_overlap=True))
+        used += gap + actual_len
     suffix.reverse()
     return suffix, used
 
 
-def _chunk_groups(
+def _parts_len(parts: list[_Part]) -> int:
+    if not parts:
+        return 0
+    total = parts[0].length
+    for idx in range(1, len(parts)):
+        total += len(_separator(parts[idx - 1], parts[idx])) + parts[idx].length
+    return total
+
+
+def _is_theorem_keep_together(pending: list[_Part], next_part: _Part, max_size: int) -> bool:
+    if not pending:
+        return False
+    cur_len = _parts_len(pending)
+    if cur_len > 360:
+        return False
+    first_txt = pending[0].block.text[pending[0].start : pending[0].end].lstrip()
+    last_txt = pending[-1].block.text[pending[-1].start : pending[-1].end].rstrip()
+    gap = len(_separator(pending[-1], next_part))
+    if cur_len + gap + next_part.length > int(max_size * 1.15):
+        return False
+    return bool(THEOREM_OPENER_RE.match(first_txt) or last_txt.endswith((":", "：", "如下", "follows")))
+
+
+def _raw_chunk_groups(
     blocks: Iterable[ContentBlock], source: ChunkSource, config: ChunkerConfig,
 ) -> Iterator[list[_Part]]:
     pending: list[_Part] = []
@@ -143,7 +206,7 @@ def _chunk_groups(
 
         for part in _prose_parts(block, config):
             gap = len(_separator(pending[-1], part)) if pending else 0
-            if length + gap + part.length > config.chunk_size:
+            if length + gap + part.length > config.chunk_size and not _is_theorem_keep_together(pending, part, config.chunk_size):
                 yield pending
                 budget = min(config.chunk_overlap, config.chunk_size - part.length - gap)
                 pending, length = _overlap_suffix(pending, budget)
@@ -153,6 +216,53 @@ def _chunk_groups(
             length += gap + part.length
     if pending:
         yield pending
+
+
+def _merge_tiny_prose_groups(groups: Iterable[list[_Part]], config: ChunkerConfig) -> Iterator[list[_Part]]:
+    """Merge tiny prose slivers (<120 chars) into adjacent same-section prose chunks while preserving streaming."""
+    buffered: list[_Part] | None = None
+    tiny_thresh = min(TINY_PROSE_THRESHOLD, max(1, config.chunk_size // 3))
+    max_merged = int(config.chunk_size * 1.18)
+    for group in groups:
+        if buffered is None:
+            # Yield full-sized groups immediately without peeking ahead to preserve streaming memory bounds
+            if _parts_len(group) >= tiny_thresh and _parts_len(group) >= int(config.chunk_size * 0.75):
+                yield group
+                continue
+            buffered = group
+            continue
+        # Only merge prose groups belonging to the exact same section and without overlap conflicts
+        buf_structured = any(p.block.kind in STRUCTURED_KINDS for p in buffered)
+        grp_structured = any(p.block.kind in STRUCTURED_KINDS for p in group)
+        same_section = (
+            buffered[-1].block.section_path == group[0].block.section_path
+            and buffered[-1].block.section_heading_block_id == group[0].block.section_heading_block_id
+        )
+        grp_has_overlap = any(p.is_overlap for p in group)
+        if not buf_structured and not grp_structured and same_section and not grp_has_overlap:
+            buf_len = _parts_len(buffered)
+            grp_len = _parts_len(group)
+            gap = len(_separator(buffered[-1], group[0]))
+            if (buf_len < tiny_thresh or grp_len < tiny_thresh) and (buf_len + gap + grp_len <= max_merged):
+                buffered = [*buffered, *group]
+                if _parts_len(buffered) >= int(config.chunk_size * 0.85):
+                    yield buffered
+                    buffered = None
+                continue
+        yield buffered
+        if _parts_len(group) >= tiny_thresh and _parts_len(group) >= int(config.chunk_size * 0.75):
+            yield group
+            buffered = None
+        else:
+            buffered = group
+    if buffered is not None:
+        yield buffered
+
+
+def _chunk_groups(
+    blocks: Iterable[ContentBlock], source: ChunkSource, config: ChunkerConfig,
+) -> Iterator[list[_Part]]:
+    yield from _merge_tiny_prose_groups(_raw_chunk_groups(blocks, source, config), config)
 
 
 def chunk_identity(source: ChunkSource, chunker_version: str, config_key: str) -> bytes:

@@ -426,7 +426,7 @@ def test_v6_migration_rolls_back_then_preserves_existing_publications(tmp_path, 
     assert KeywordSearchService(upgraded).search("published") == before
     assert IndexJobStore(upgraded).list_jobs() == []
     with upgraded.connect() as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (7,)
+        assert db.execute("PRAGMA user_version").fetchone() == (8,)
         assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 

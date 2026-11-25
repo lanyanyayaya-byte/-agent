@@ -18,6 +18,9 @@ import {
   type McpSummary,
   type Message,
   type RetrievalMode,
+  type RetrievalStrategy,
+  type RetrievalTraceData,
+  type RetrievalTraceSummary,
   type RunState,
   type RunSummary,
   type SessionSummary,
@@ -32,6 +35,7 @@ import {
 import type { ArtifactSummary, RunEvent, ToolCategory, ToolSource } from './api/chatEvents';
 import GrantPanel from './GrantPanel';
 import MarkdownAnswer from './MarkdownAnswer';
+import RetrievalTraceCard from './RetrievalTraceCard';
 
 const MESSAGE_LIMIT = 20_000;
 const POLL_INTERVAL_MS = 1000;
@@ -108,6 +112,8 @@ type Conversation = Pick<SessionSummary, 'session_id' | 'title'> & {
   skillsByRun?: Record<string, ActivatedSkillBadge[]>;
   artifactsByRun?: Record<string, ArtifactSummary[]>;
   citationsByRun?: Record<string, StoredCitation[]>;
+  traceByRun?: Record<string, RetrievalTraceData>;
+  traceSummaryByRun?: Record<string, RetrievalTraceSummary>;
   live?: LiveTurn;
   submittingError?: string;
   submittingErrorCode?: string;
@@ -749,7 +755,7 @@ export default function Chat({
   const [stopping, setStopping] = useState<string>();
   const [ragEnabled, setRagEnabled] = useState(defaultRagEnabled);
   const [ragMode, setRagMode] = useState<RetrievalMode>('hybrid');
-  const [ragCoverage, setRagCoverage] = useState<CoverageMode>('global');
+  const [ragCoverage, setRagCoverage] = useState<CoverageMode | 'book_summary'>('global');
   const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
   const [textbooks, setTextbooks] = useState<DocumentSummary[]>([]);
   const [textbooksLoading, setTextbooksLoading] = useState(false);
@@ -1246,8 +1252,13 @@ export default function Chat({
       enabled: true,
       document_ids: selectedDocs.length > 0 ? selectedDocs : null,
       retrieval_mode: ragMode,
-      coverage_mode: ragCoverage,
-      top_k: 6,
+      coverage_mode: (ragCoverage === 'per_document' ? 'per_document' : 'global') as CoverageMode,
+      strategy: (ragCoverage === 'book_summary'
+        ? 'book_summary'
+        : ragCoverage === 'per_document'
+          ? 'compare'
+          : (selectedDocs.length > 0 ? 'scoped' : 'global')) as RetrievalStrategy,
+      top_k: ragCoverage === 'per_document' ? 12 : ragCoverage === 'book_summary' ? 24 : 8,
     } : undefined;
     const mcpOptions = {
       enabled: useMcp,
@@ -1324,6 +1335,17 @@ export default function Chat({
             return {
               ...session,
               citationsByRun: { ...session.citationsByRun, [item.run_id]: item.data.citations },
+            };
+          });
+        } else if (item.type === 'retrieval_trace') {
+          updateSession(id, (session) => {
+            if (session.live?.requestId !== requestId || session.live.runId !== item.run_id || session.live.detached) {
+              return session;
+            }
+            return {
+              ...session,
+              traceByRun: { ...session.traceByRun, [item.run_id]: item.data.trace },
+              traceSummaryByRun: { ...session.traceSummaryByRun, [item.run_id]: item.data.summary },
             };
           });
         } else {
@@ -1849,6 +1871,12 @@ export default function Chat({
                   const turnSkills = resolveTurnSkills(active.skillsByRun?.[user.run_id], run?.skill_activations);
                   const turnArtifacts = resolveTurnArtifacts(active.artifactsByRun?.[user.run_id], run?.artifacts);
                   const turnCitations = active.citationsByRun?.[user.run_id] ?? run?.citations;
+                  const turnTraceSummary = active.traceSummaryByRun?.[user.run_id] ?? run?.retrieval_trace_summary;
+                  const turnLiveTrace = active.traceByRun?.[user.run_id];
+                  const isLegacyRag = Boolean(
+                    (turnCitations && turnCitations.length > 0)
+                    || turnTools?.some((t) => t.name === 'search_knowledge'),
+                  );
                   return (
                     <article key={user.message_id} className="turn">
                       <div className="turn-user-row">
@@ -1866,6 +1894,13 @@ export default function Chat({
                             </small>
                           </div>
                           <ToolActivity tools={turnTools} skills={turnSkills} status={status} />
+                          <RetrievalTraceCard
+                            client={client}
+                            runId={user.run_id}
+                            summary={turnTraceSummary}
+                            liveTrace={turnLiveTrace}
+                            isLegacyRagRun={isLegacyRag}
+                          />
                           {assistant && (
                             <MarkdownAnswer
                               ariaLabel="已保存回答"
@@ -1924,6 +1959,14 @@ export default function Chat({
                             tools={active.toolsByRun?.[live.runId]}
                             skills={active.skillsByRun?.[live.runId]}
                             status={active.activeStatus}
+                          />
+                        )}
+                        {live.runId && (
+                          <RetrievalTraceCard
+                            client={client}
+                            runId={live.runId}
+                            summary={active.traceSummaryByRun?.[live.runId]}
+                            liveTrace={active.traceByRun?.[live.runId]}
                           />
                         )}
                         {showDraft && <MarkdownAnswer ariaLabel="回答草稿" content={live.draft} />}
@@ -2261,9 +2304,10 @@ export default function Chat({
                           <select
                             aria-label="教材问答召回策略"
                             value={ragCoverage}
-                            onChange={(e) => setRagCoverage(e.target.value as CoverageMode)}>
+                            onChange={(e) => setRagCoverage(e.target.value as CoverageMode | 'book_summary')}>
                             <option value="global">全局相关性</option>
                             <option value="per_document">跨教材对比</option>
+                            <option value="book_summary">单本全文 / 章节总结</option>
                           </select>
                         </label>
                         <label>

@@ -2,14 +2,20 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, Request, Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.library import DocumentId, require_library
 from app.security import ApiError
 from app.services.index_readiness import PublishedIndexReadiness
+from app.services.index_status import (
+    BatchIndexResult, IndexJobBrief, IndexStatusService, KnowledgeIndexOverview, _job_brief,
+)
 from app.services.index_worker import IndexJobProgress, IndexJobState, IndexWorker
 from app.services.library import DOCUMENT_ID_PATTERN
-from app.storage.index_jobs import PIPELINE_JOB_TYPE, IndexJob, IndexJobError, IndexJobStatus
+from app.storage.index_jobs import (
+    ALL_PIPELINE_JOB_TYPES, PIPELINE_JOB_TYPE, IndexJob, IndexJobError, IndexJobStatus,
+)
+from app.storage.knowledge_settings import KnowledgeSettings
 
 JOB_ID_PATTERN = r"^[0-9a-f]{32}$"
 JobId = Annotated[str, Path(pattern=JOB_ID_PATTERN)]
@@ -151,5 +157,115 @@ def index_job_router(host_namespace: str, require_ready) -> APIRouter:
             raise _job_not_found()
         response.headers["Cache-Control"] = "no-store"
         return worker.progress(job)
+
+    return router
+
+
+class UpdateKnowledgeSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    auto_index_on_import: bool | None = None
+    cloud_embedding_enabled: bool | None = None
+    cloud_rerank_enabled: bool | None = None
+    enable_bilingual_rewrite: bool | None = None
+    default_top_k: Annotated[int, Field(ge=1, le=50)] | None = None
+    compare_top_k: Annotated[int, Field(ge=1, le=50)] | None = None
+    rerank_candidates: Annotated[int, Field(ge=1, le=100)] | None = None
+    min_vector_similarity: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+
+
+class RebuildIndexRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    force_rebuild: bool = False
+
+
+def _require_index_status(request: Request) -> IndexStatusService:
+    svc: IndexStatusService | None = getattr(request.app.state, "index_status", None)
+    if svc is None:
+        raise ApiError(503, "KNOWLEDGE_STORE_UNAVAILABLE", "教材索引服务暂不可用。")
+    return svc
+
+
+def index_overview_router(require_ui, require_ready) -> APIRouter:
+    router = APIRouter(
+        prefix="/api/v1/knowledge",
+        dependencies=[Depends(require_ui), Depends(require_ready), Depends(require_library)],
+    )
+
+    @router.get("/index-status")
+    def index_status(request: Request, response: Response) -> KnowledgeIndexOverview:
+        response.headers["Cache-Control"] = "no-store"
+        return _require_index_status(request).get_overview()
+
+    @router.get("/settings")
+    def get_settings(request: Request, response: Response) -> KnowledgeSettings:
+        response.headers["Cache-Control"] = "no-store"
+        return _require_index_status(request).settings_store.get()
+
+    @router.post("/settings")
+    def update_settings(
+        body: UpdateKnowledgeSettings, request: Request, response: Response,
+    ) -> KnowledgeSettings:
+        svc = _require_index_status(request)
+        try:
+            updated = svc.settings_store.update(**body.model_dump(exclude_none=True))
+        except ValueError as error:
+            raise ApiError(422, "VALIDATION_ERROR", str(error)) from None
+        response.headers["Cache-Control"] = "no-store"
+        return updated
+
+    @router.post("/index-all")
+    def index_all(request: Request, response: Response) -> BatchIndexResult:
+        response.headers["Cache-Control"] = "no-store"
+        return _require_index_status(request).index_all_missing()
+
+    @router.post("/rebuild-stale")
+    def rebuild_stale(request: Request, response: Response) -> BatchIndexResult:
+        response.headers["Cache-Control"] = "no-store"
+        return _require_index_status(request).rebuild_stale()
+
+    @router.post("/documents/{document_id}/rebuild-index")
+    def rebuild_document_index(
+        document_id: DocumentId,
+        request: Request,
+        response: Response,
+        body: RebuildIndexRequest | None = None,
+    ) -> IndexJobBrief | None:
+        svc = _require_index_status(request)
+        current = svc.store.latest_version_identity(document_id)
+        if current is None:
+            raise ApiError(404, "TEXTBOOK_NOT_FOUND", "该教材已不存在。")
+        version_id, _ = current
+        force = body.force_rebuild if body is not None else False
+        job = svc.enqueue_for_document(document_id, version_id, force_rebuild=force)
+        response.headers["Cache-Control"] = "no-store"
+        return _job_brief(job)
+
+    @router.post("/documents/{document_id}/cancel-index")
+    def cancel_document_index(
+        document_id: DocumentId, request: Request, response: Response,
+    ) -> IndexJobBrief | None:
+        svc = _require_index_status(request)
+        current = svc.store.latest_version_identity(document_id)
+        if current is None:
+            raise ApiError(404, "TEXTBOOK_NOT_FOUND", "该教材已不存在。")
+        version_id, _ = current
+        jobs = svc.worker.jobs.list_jobs(document_id=document_id, limit=10)
+        active = next(
+            (
+                j for j in jobs
+                if j.document_version_id == version_id
+                and j.job_type in ALL_PIPELINE_JOB_TYPES
+                and j.status in ("queued", "running", "retry_wait")
+            ),
+            None,
+        )
+        if active is None:
+            response.headers["Cache-Control"] = "no-store"
+            return None
+        cancelled = svc.worker.jobs.request_cancel(active.job_id)
+        response.headers["Cache-Control"] = "no-store"
+        return _job_brief(cancelled)
 
     return router

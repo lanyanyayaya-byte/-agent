@@ -2,15 +2,16 @@
 
 <p align="center">
   <strong>面向 macOS Apple Silicon 的本地优先 AI Agent 桌面助手</strong><br />
-  集成 DeepSeek 实时流式对话、理工科教材知识库（RAG + 原文级引用溯源）、受控只读本地文件工具、MCP 外部工具生态与 Agent Skills / Workspace / Runtime 真实文件交付能力
+  集成 DeepSeek 实时流式对话、理工科教材知识库（RAG 2.0 + 检索实验室 + 原文级引用溯源）、受控只读本地文件工具、MCP 外部工具生态与 Agent Skills / Workspace / Runtime 真实文件交付能力
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.4.0-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.5.0-blue" />
   <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-24C8DB" />
   <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB" />
   <img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB" />
+  <img alt="RAG" src="https://img.shields.io/badge/RAG%202.0-BGE--M3%20%2B%20Reranker-10B981" />
   <img alt="MCP" src="https://img.shields.io/badge/MCP%20SDK-2.3.0-6B4FBB" />
   <img alt="Skills" src="https://img.shields.io/badge/Agent%20Skills-SKILL.md-0EA5E9" />
 </p>
@@ -53,11 +54,14 @@
 - **幂等与主动取消**：支持同会话 `client_request_id` 幂等防重、随时停止生成；取消或异常的半截草稿不会污染正式消息历史。
 - **LangGraph Checkpointer 安全基线**：仅在图执行与业务 SQLite 事务同时提交成功后推进 `last_safe_checkpoint_id`，故障或取消自动隔离。
 
-### 2. 理工科教材知识库（RAG）与原文级引用溯源
-- **受控导入与去重**：支持 **PDF、DOCX、Markdown**（单文件 $\le 100\text{ MiB}$），基于内容 SHA-256 去重与版本管理，独立解析子进程防内存溢出。
-- **双通道混合检索**：本地 SQLite FTS5（逐汉字预处理，优化中文术语召回）+ SiliconFlow `BAAI/bge-m3`（1024 维）精确余弦向量检索 + RRF 融合；未配置 SiliconFlow Key 时自动优雅降级为纯本地关键词检索。
-- **多模式检索与跨教材对比**：支持「全局相关性」与「跨教材对比」覆盖策略、多轮追问指代消解及「本地教材检索」面板（无需配置 DeepSeek 即可检索教材原文）。
-- **可核验引用卡片与公式护栏**：精确溯源至 PDF 物理页/页标签、Markdown 行号、DOCX 段落与表格；对 PDF 缺失数学字形（`PDF_UNMAPPED_GLYPHS`）注入安全提示并持久化历史引用卡片。
+### 2. 理工科教材知识库（RAG 2.0）与全链路检索可观测（`v0.5.0` 重大升级）
+- **多选导入与自动后台索引**：支持单选/多选批量导入 **PDF、DOCX、Markdown**（单文件 $\le 100\text{ MiB}$），导入后由后台 `IndexWorker` 自动完成解析、分块、BM25 与 BGE-M3 向量化；支持一次性全局云端向量授权、知识库真实状态总览与「一键补全索引 / 重建待升级索引」（已完整教材跳过、未变化切片自动复用 Embedding 缓存）。
+- **混合检索 + 语义精排 + 双语扩展**：自然语言拆词 BM25（FTS5）+ SiliconFlow `BAAI/bge-m3`（1024 维）余弦召回 + RRF 融合 + **`BAAI/bge-reranker-v2-m3`** 精排；支持中英文轻量查询改写与跨语言术语优先扩展、References 软降权与按需相邻 Chunk 上下文扩展；向量或精排不可用时自动优雅降级并明确展示原因。
+- **PDF 解析 V3、Chunk V2 与全文/章节总结**：内置 macOS 原生 Vision OCR（扫描书与稀疏扫描插页局部 OCR）、页眉/页脚抑制、英文断行连字符合并、`CMMI`/`CMSY` 数学与希腊符号恢复、词句边界对齐切片（消除英文断词）；新增 **`book_summary` 全文与章节总结策略**，按章节结构覆盖并输出已覆盖/跳过范围。
+- **RAG 检索实验室、聊天检索追踪与 Chunk 浏览器**：
+  - **检索实验室**：直接复用生产检索链路（支持 BM25 / Vector / Hybrid / Hybrid+Reranker、Top-K、候选数、相似度阈值、双语改写开关），关闭 LLM 改写时完全独立于 DeepSeek 运行；
+  - **聊天检索过程卡片**：每轮 RAG 问答上方提供可折叠检索轨迹卡片（持久化至 SQLite V8 `run_retrieval_traces`，支持重启回看与失败留痕）；
+  - **Chunk 原文浏览器**：按页码/章节/关键词浏览切片原文、字符数、向量状态、解析警告、相邻切片并一键打开原 PDF。
 
 ### 3. MCP 外部工具生态（`mcp==2.3.0`）
 - **双传输协议**：同时支持本地 **stdio** 与远程 **Streamable HTTP** 协议。
@@ -93,10 +97,10 @@ flowchart TD
     HOST["Tauri 2 Rust 宿主\n进程监督 · Keychain · 原生授权/信任弹窗 · host_token"]
     SIDECAR["Python 3.12 FastAPI Sidecar\n127.0.0.1:0 动态端口 · 双 Token 鉴权"]
     AGENT["LangGraph Agent & RunTools\n实时流式 · 工具快照 · 统一预算 · Checkpointer"]
-    RAG["教材知识库引擎\nPDF/DOCX/MD 解析 · FTS5 + BGE-M3 混合检索 · 引用核验"]
+    RAG["教材知识库引擎 (RAG 2.0)\nParser V3 / Vision OCR · FTS5 + BGE-M3 + BGE-Reranker · 检索追踪 · 总结"]
     MCP["MCP Manager (mcp==2.3.0)\nstdio 子进程管理 · Streamable HTTP"]
     SKILLS["Skills / Workspace / Runtime\n标准 SKILL.md · 独立 Python/Node 执行 · 产物交付"]
-    DB[("本地 SQLite (WAL)\n业务库 V7 · Checkpoints · 知识库")]
+    DB[("本地 SQLite (WAL)\n业务库 V8 · Checkpoints · 知识库 V8")]
     EXT["外部服务\nDeepSeek · SiliconFlow · 远程/本地 MCP · GitHub Skills"]
 
     UI -- "受限 IPC (凭据/文件/MCP/Skills/产物操作)" --> HOST
@@ -204,8 +208,8 @@ pnpm --dir frontend install --frozen-lockfile
 构建产物位置：
 - **桌面应用包**：`desktop/target/packaging/apps/onedir/KnowledgeAgent.app`（约 129 MB）
 - **安装镜像**：
-  - `desktop/target/aarch64-apple-darwin/release/bundle/dmg/KnowledgeAgent_0.4.0_aarch64.dmg`（约 70 MB）
-  - `desktop/target/packaging/dmg/KnowledgeAgent_0.4.0_aarch64-test.dmg`（约 70 MB，同镜像副本）
+  - `desktop/target/aarch64-apple-darwin/release/bundle/dmg/KnowledgeAgent_0.5.0_aarch64.dmg`（约 73 MB）
+  - `desktop/target/packaging/dmg/KnowledgeAgent_0.5.0_aarch64-test.dmg`（约 73 MB，同镜像副本）
 
 > 当前打包脚本采用个人使用版 **ad-hoc 签名**（`signingIdentity: "-"`），未进行 Apple Developer ID 商业签名与 Apple 公证。首次打开如遇系统拦截，可右键 `KnowledgeAgent.app` 选择「打开」，或在「系统设置 → 隐私与安全性」中点击「仍要打开」。
 
@@ -289,15 +293,15 @@ which mcp-server-fetch arxiv-mcp-server
 ## 自动化测试
 
 ```sh
-# 后端全量测试与字节码检查（含 P9 Workspace / Runtime / Skills / 稳定性回归）
+# 后端全量测试与字节码检查（433 passed，含 RAG 2.0 / Skills / MCP / Workspace 回归）
 (cd backend && uv run --locked pytest && uv run --locked python -m compileall -q app tests)
 
-# 前端类型检查、单元测试与生产构建（43 passed）
+# 前端类型检查、单元测试与生产构建（42 passed）
 pnpm --dir frontend exec tsc --noEmit
 pnpm --dir frontend test
 pnpm --dir frontend build
 
-# Rust 宿主格式、单元测试与发布检查（25 passed）
+# Rust 宿主格式、单元测试与发布检查（26 passed）
 (cd desktop && cargo fmt --check && cargo test --locked)
 (cd desktop && cargo check --locked --release --features custom-protocol)
 ```
@@ -311,17 +315,18 @@ pnpm --dir frontend build
 ~/Library/Application Support/local.knowledgeagent.desktop/
 ```
 
-从旧版本（如 `v0.3.0`，Schema V6）升级至 `v0.4.0`（Schema V7）时：
+从旧版本（如 `v0.4.0`，业务库 V7 / 知识库 V7）升级至 `v0.5.0`（业务库 V8 / 知识库 V8）时：
 1. 完全退出正在运行的旧版应用（菜单栏 `KnowledgeAgent → 退出` 或 `Cmd+Q`）；
-2. 强烈建议先备份数据目录（V6 → V7 为单向架构升级）：
+2. 强烈建议先备份数据目录（V7 → V8 为单向架构升级）：
    ```sh
    cp -R "$HOME/Library/Application Support/local.knowledgeagent.desktop" \
      "$HOME/Library/Application Support/local.knowledgeagent.desktop.backup-$(date +%Y%m%d-%H%M%S)"
    ```
-3. 打开新版 `KnowledgeAgent_0.4.0_aarch64.dmg`，将 `KnowledgeAgent.app` 拖入 `/Applications/` 覆盖旧版后启动：
-   - SQLite 自动执行 V6 → V7 迁移，新增 `skills`、`workspace_files`、`artifacts`、`run_skill_activations` 表并扩展 `tool_calls`，完整保留全部历史会话、消息、教材知识库、向量索引、MCP 服务配置与授权；
-   - 自动发现并注册内置技能（`word-formatting`、`mind-map`）；
-4. 因个人版为 ad-hoc 签名，覆盖更新后首次启动若弹出 macOS 钥匙串授权框，点击「始终允许」即可自动恢复已保存的模型 API Key 与 MCP 密钥。
+3. 打开新版 `KnowledgeAgent_0.5.0_aarch64.dmg`，将 `KnowledgeAgent.app` 拖入 `/Applications/` 覆盖旧版后启动：
+   - 业务数据库自动执行 V7 → V8 迁移（新增 `run_retrieval_traces` 表），知识库数据库自动执行 V7 → V8 迁移（新增 `knowledge_settings` 表）；
+   - 完整保留全部历史会话与消息、全部教材原件、已建立的 BM25 与向量索引、历史引用、MCP 服务配置与授权、已安装 Skills、Workspace 与历史 Artifact；
+   - **不会删除已有索引或强制重新向量化全部教材**：旧版解析/切片索引升级后保持可直接检索，并在教材列表显示「待升级」状态，可由用户按需点击「一键补全索引」或「重建待升级索引」升级（未变化切片自动复用 Embedding 缓存）；
+4. 因个人版为 ad-hoc 签名，覆盖更新后首次启动若弹出 macOS 钥匙串授权框，点击「始终允许」即可自动恢复已保存的 DeepSeek / SiliconFlow API Key 与 MCP 密钥。
 
 ---
 
@@ -338,10 +343,11 @@ pnpm --dir frontend build
 
 ## 架构与设计文档
 
-- [系统架构设计（v0.4）](架构.md)
+- [系统架构设计（v0.5）](架构.md)
 - [API / SSE / IPC 接口契约（v0.2）](接口.md)
-- [开发路线与阶段验收标准（v0.5）](开发路线与验收.md)
+- [开发路线与阶段验收标准（v0.6）](开发路线与验收.md)
 - [教材知识库 RAG 架构方案（v0.2）](KnowledgeAgent_RAG_Architecture_v0.2.md)
+- [RAG 2.0 专项架构与检索优化方案（v0.1 · 已交付 v0.5.0）](KnowledgeAgent_RAG_2.0_Architecture_v0.1.md)
 - [MCP 集成架构与安全方案（v0.2）](KnowledgeAgent_MCP_Architecture_v0.2.md)
 - [Workspace、Runtime 与 Agent Skills 架构方案（v0.1 + 第16节修订）](KnowledgeAgent_Skills_Architecture_v0.1.md)
 - [项目进度、缺陷分析与后续开发计划](项目进度与缺陷分析及后续开发计划.md)

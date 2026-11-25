@@ -14,9 +14,12 @@ IndexJobStage = Literal["parsing", "chunking", "embedding", "keyword_indexing", 
 IndexJobStatus = Literal["queued", "running", "retry_wait", "succeeded", "failed", "cancelled"]
 STAGES = get_args(IndexJobStage)
 PIPELINE_JOB_TYPE = "index_pipeline"
+LOCAL_PIPELINE_JOB_TYPE = "index_local"
+ALL_PIPELINE_JOB_TYPES: tuple[str, ...] = (PIPELINE_JOB_TYPE, LOCAL_PIPELINE_JOB_TYPE)
 PIPELINE_STAGES: tuple[IndexJobStage, ...] = ("parsing", "chunking", "keyword_indexing", "embedding", "publishing")
+LOCAL_PIPELINE_STAGES: tuple[IndexJobStage, ...] = ("parsing", "chunking", "keyword_indexing", "publishing")
 PIPELINE_MANAGED_SET = f"""EXISTS (SELECT 1 FROM index_jobs AS j
-    WHERE j.document_version_id = s.document_version_id AND j.job_type = '{PIPELINE_JOB_TYPE}')"""
+    WHERE j.document_version_id = s.document_version_id AND j.job_type IN ('{PIPELINE_JOB_TYPE}', '{LOCAL_PIPELINE_JOB_TYPE}'))"""
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 JOB_FIELDS = """job_id, document_id, document_version_id, job_type, config_key, previous_job_id,
     stage, status, completed_work, total_work, created_at, started_at, updated_at, finished_at, error_code,
@@ -189,18 +192,28 @@ class IndexJobStore:
                 (document_id, document_id, status, status, job_type, job_type, limit, offset))]
 
     def claim_next(
-        self, instance_id: str | UUID, *, lease_seconds: int = DEFAULT_LEASE_SECONDS, job_type: str | None = None,
+        self, instance_id: str | UUID, *, lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        job_type: str | tuple[str, ...] | None = None,
         job_id: str | None = None, config_keys: tuple[str, ...] | None = None, wait: bool = True,
     ) -> IndexJobClaim | None:
         _lease_duration(lease_seconds)
         if not isinstance(instance_id, (str, UUID)) or not 1 <= len(str(instance_id).strip()) <= 128:
             raise ValueError("Invalid index job execution instance.")
         config_filter = "" if config_keys is None else " AND config_key IN (" + ", ".join("?" for _ in config_keys) + ")"
+        if job_type is None:
+            type_filter = ""
+            type_params: tuple = ()
+        elif isinstance(job_type, tuple):
+            type_filter = " AND job_type IN (" + ", ".join("?" for _ in job_type) + ")"
+            type_params = job_type
+        else:
+            type_filter = " AND job_type = ?"
+            type_params = (job_type,)
         candidate = f"""SELECT job_id FROM index_jobs
             WHERE status IN ('queued', 'retry_wait') AND (next_retry_at IS NULL OR next_retry_at <= unixepoch())
-                AND (? IS NULL OR job_type = ?) AND (? IS NULL OR job_id = ?) {config_filter}
+                {type_filter} AND (? IS NULL OR job_id = ?) {config_filter}
             ORDER BY created_at, job_id LIMIT 1"""
-        params = (job_type, job_type, job_id, job_id, *(config_keys or ()))
+        params = (*type_params, job_id, job_id, *(config_keys or ()))
         # Poll the WAL snapshot while idle. Re-select under the writer reservation when work may be available.
         with self.store.connect() as db:
             expired = db.execute("""SELECT 1 FROM index_jobs
@@ -253,7 +266,7 @@ class IndexJobStore:
                 raise IndexJobError("INDEX_PUBLICATION_REQUIRES_CLAIM")
             return
         job = self.require_active_claim(db, claim)
-        if job.job_type != PIPELINE_JOB_TYPE or db.execute(f"""SELECT 1
+        if job.job_type not in ALL_PIPELINE_JOB_TYPES or db.execute(f"""SELECT 1
             FROM chunk_sets AS s JOIN document_versions AS v USING (document_version_id)
             WHERE s.chunk_set_id = ? AND v.document_version_id = ?
               AND v.document_id = ? {CURRENT_VERSION}""",
@@ -270,7 +283,14 @@ class IndexJobStore:
             raise ValueError("Invalid index job progress.")
         with self.store.write() as db:
             job = self.require_active_claim(db, claim)
-            stages = PIPELINE_STAGES if job.job_type == PIPELINE_JOB_TYPE else STAGES
+            if job.job_type == PIPELINE_JOB_TYPE:
+                stages = PIPELINE_STAGES
+            elif job.job_type == LOCAL_PIPELINE_JOB_TYPE:
+                stages = LOCAL_PIPELINE_STAGES
+            else:
+                stages = STAGES
+            if stage not in stages or job.stage not in stages:
+                raise IndexJobError("INDEX_JOB_INVALID_STAGE_TRANSITION")
             step = stages.index(stage) - stages.index(job.stage)
             if step not in (0, 1):
                 raise IndexJobError("INDEX_JOB_INVALID_STAGE_TRANSITION")

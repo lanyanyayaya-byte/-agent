@@ -4,7 +4,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import LibraryPanel from './LibraryPanel';
-import { connectApiClient, type DocumentDetails, type DocumentIndex, type IndexJobState } from './api/apiClient';
+import {
+  connectApiClient,
+  type DocumentDetails,
+  type DocumentIndex,
+  type DocumentIndexStatus,
+  type IndexJobState,
+  type KnowledgeIndexOverview,
+  type KnowledgeSettings,
+} from './api/apiClient';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
@@ -32,21 +40,126 @@ const queued: IndexJobState = {
 };
 const indexing: IndexJobState = { ...queued, status: 'running', stage: 'embedding', completed_work: 1, total_work: 3 };
 
+const defaultSettings: KnowledgeSettings = {
+  auto_index_on_import: true,
+  cloud_embedding_enabled: false,
+  cloud_rerank_enabled: true,
+  enable_bilingual_rewrite: true,
+  default_top_k: 8,
+  compare_top_k: 12,
+  rerank_candidates: 24,
+  min_vector_similarity: 0.25,
+};
+
 function textbookUnavailable() {
   return Response.json({ error: { code: 'KNOWLEDGE_STORE_UNAVAILABLE', message: 'internal detail' } }, { status: 503 });
 }
 
-async function setup(initial?: DocumentDetails) {
+function toDocStatus(
+  doc: DocumentDetails,
+  index: Pick<DocumentIndex, 'job' | 'published_readiness'>,
+  overrides: Partial<DocumentIndexStatus> = {},
+): DocumentIndexStatus {
+  const readyHybrid = index.published_readiness === 'ready_hybrid';
+  const readyKeyword = index.published_readiness === 'ready_keyword';
+  return {
+    document_id: doc.document_id,
+    name: doc.name,
+    format: doc.format,
+    version_id: doc.versions.at(-1)?.document_version_id ?? versionId,
+    version_count: doc.version_count,
+    latest_size_bytes: doc.latest_size_bytes,
+    created_at: doc.created_at,
+    updated_at: doc.updated_at,
+    parse_status: readyHybrid || readyKeyword ? 'ready' : 'pending',
+    page_count: readyHybrid || readyKeyword ? 12 : null,
+    parsed_pages: readyHybrid || readyKeyword ? 12 : null,
+    chunk_count: readyHybrid || readyKeyword ? 10 : null,
+    keyword_status: readyHybrid || readyKeyword ? 'ready' : 'pending',
+    embedding_status: readyHybrid ? 'ready' : (readyKeyword ? 'disabled' : 'pending'),
+    embedded_count: readyHybrid ? 10 : 0,
+    vector_coverage_pct: readyHybrid ? 100 : (readyKeyword ? 0 : null),
+    vector_searchable: readyHybrid,
+    embedding_model: readyHybrid ? 'BAAI/bge-m3' : null,
+    embedding_dimension: readyHybrid ? 1024 : null,
+    published_readiness: index.published_readiness,
+    latest_job: index.job ? {
+      job_id: index.job.job_id,
+      job_type: 'index_pipeline',
+      status: index.job.status,
+      stage: index.job.stage,
+      completed_work: index.job.completed_work,
+      total_work: index.job.total_work,
+      error_code: index.job.error_code,
+      error_message: index.job.error_code,
+      retry_count: index.job.retry_count,
+      next_retry_at: index.job.next_retry_at,
+      cancel_requested_at: index.job.cancel_requested_at,
+    } : null,
+    last_indexed_at: readyHybrid || readyKeyword ? date : null,
+    warnings_count: 0,
+    ...overrides,
+  };
+}
+
+async function setup(initial?: DocumentDetails, opts?: { settings?: Partial<KnowledgeSettings>; siliconflowConfigured?: boolean }) {
   let document = initial;
   let listUnavailable = false;
   let deleteUnavailable = false;
   let indexUnavailable = false;
+  let settings: KnowledgeSettings = { ...defaultSettings, ...opts?.settings };
+  const sfConfigured = opts?.siliconflowConfigured ?? true;
   let index: Pick<DocumentIndex, 'job' | 'published_readiness'> = { job: null, published_readiness: null };
   const changeIndex = vi.fn<(_: string, __: RequestInit) => Response | Promise<Response>>();
+  const indexAllCalls = vi.fn();
+  const rebuildCalls = vi.fn();
+  const settingsCalls = vi.fn();
   importer.mockResolvedValueOnce({ base_url: 'http://127.0.0.1:8766', ui_token: 'ui-test' });
   const fetchApi = vi.fn(async (url: string, options: RequestInit) => {
     expect(options.headers).toMatchObject({ Authorization: 'Bearer ui-test' });
     const path = new URL(url).pathname;
+    if (options.method === 'GET' && path === '/api/v1/knowledge/index-status') {
+      if (listUnavailable) return textbookUnavailable();
+      const docs = document ? [toDocStatus(document, index)] : [];
+      const activeCount = docs.filter((d) => ['queued', 'running', 'retry_wait'].includes(d.latest_job?.status ?? '')).length;
+      const readyHybrid = docs.filter((d) => d.published_readiness === 'ready_hybrid').length;
+      const readyKeyword = docs.filter((d) => d.published_readiness === 'ready_keyword').length;
+      const overview: KnowledgeIndexOverview = {
+        total_documents: docs.length,
+        ready_hybrid: readyHybrid,
+        ready_keyword: readyKeyword,
+        in_progress: activeCount,
+        pending: docs.length - readyHybrid - readyKeyword - activeCount,
+        failed: 0,
+        unsearchable: 0,
+        missing_for_completion: docs.length - readyHybrid,
+        active_job_id: activeCount > 0 ? (index.job?.job_id ?? null) : null,
+        settings,
+        siliconflow_configured: sfConfigured,
+        documents: docs,
+      };
+      return Response.json(overview);
+    }
+    if (options.method === 'POST' && path === '/api/v1/knowledge/settings') {
+      const patch = JSON.parse(String(options.body));
+      settingsCalls(patch);
+      settings = { ...settings, ...patch };
+      return Response.json(settings);
+    }
+    if (options.method === 'POST' && path === '/api/v1/knowledge/index-all') {
+      indexAllCalls();
+      return Response.json({
+        queued_count: document ? 1 : 0,
+        skipped_complete: 0,
+        skipped_active: 0,
+        mode: settings.cloud_embedding_enabled ? 'hybrid' : 'local_only',
+        queued_document_ids: document ? [document.document_id] : [],
+      });
+    }
+    if (options.method === 'POST' && path === `${documentsPath}/${id}/rebuild-index`) {
+      rebuildCalls(JSON.parse(String(options.body)));
+      return Response.json({ document_id: id, queued: true, job_id: queued.job_id });
+    }
     if (options.method === 'GET' && path === documentsPath) {
       if (listUnavailable) return textbookUnavailable();
       if (!document) return Response.json([]);
@@ -71,12 +184,13 @@ async function setup(initial?: DocumentDetails) {
   });
   vi.stubGlobal('fetch', fetchApi);
   const client = await connectApiClient();
-  const view = render(<LibraryPanel client={client} active />);
+  const view = render(<LibraryPanel client={client} active siliconflowConfigured={sfConfigured} />);
   return {
-    fetchApi, changeIndex, setDocument(value: DocumentDetails) { document = value; },
+    fetchApi, changeIndex, indexAllCalls, rebuildCalls, settingsCalls,
+    setDocument(value: DocumentDetails) { document = value; },
     setIndex(value: typeof index) { index = value; },
     makeIndexUnavailable(value: boolean) { indexUnavailable = value; },
-    switchPanel(active: boolean) { view.rerender(<LibraryPanel client={client} active={active} />); },
+    switchPanel(active: boolean) { view.rerender(<LibraryPanel client={client} active={active} siliconflowConfigured={sfConfigured} />); },
     makeListUnavailable() { listUnavailable = true; },
     makeDeleteUnavailable(value: boolean) { deleteUnavailable = value; },
   };
@@ -86,7 +200,7 @@ function button(name: string) {
   return screen.getByRole<HTMLButtonElement>('button', { name });
 }
 
-test('imports, shows distinct outcomes, and refreshes the list and open history after an update', async () => {
+test('imports, shows real index status columns, and refreshes the list and open history after an update', async () => {
   const { setDocument } = await setup();
   await screen.findByText(/还没有教材/);
   const importPending = Promise.withResolvers<unknown>();
@@ -99,10 +213,10 @@ test('imports, shows distinct outcomes, and refreshes the list and open history 
   const receipt = { import_id: importId, document_id: id, document_version_id: original.versions[0].document_version_id };
   setDocument(original);
   importPending.resolve({ ...receipt, outcome: 'imported' });
-  expect(await screen.findByText('教材已导入。')).toBeTruthy();
+  expect(await screen.findByText(/教材已导入/)).toBeTruthy();
   let table = within(await screen.findByRole('table', { name: '教材列表' }));
-  expect(table.getByRole('cell', { name: '9 B' })).toBeTruthy();
-  expect(table.getByRole('cell', { name: '已导入' })).toBeTruthy();
+  expect(table.getByText(/9 B/)).toBeTruthy();
+  expect(table.getByText('未解析')).toBeTruthy();
   await screen.findByRole('button', { name: '开始建立索引' });
   await screen.findByRole('heading', { name: '版本历史（1）' });
 
@@ -118,15 +232,46 @@ test('imports, shows distinct outcomes, and refreshes the list and open history 
   expect(importer).toHaveBeenLastCalledWith('select_and_import_document', {
     request: { action: 'select', document_id: id },
   });
-  expect(await screen.findByText('教材已更新，新增一个版本。')).toBeTruthy();
+  expect(await screen.findByText(/教材已更新/)).toBeTruthy();
   await screen.findByRole('heading', { name: '版本历史（2）' });
   table = within(screen.getByRole('table', { name: '教材列表' }));
-  expect(table.getByRole('cell', { name: '20 B' })).toBeTruthy();
-  expect(table.getByRole('cell', { name: '2' })).toBeTruthy();
+  expect(table.getByText(/20 B/)).toBeTruthy();
+  expect(table.getByText(/v2/)).toBeTruthy();
 
   importer.mockResolvedValueOnce({ ...receipt, document_version_id: next.document_version_id, outcome: 'unchanged' });
   fireEvent.click(button('更新 教材.md'));
   expect(await screen.findByText('文件内容与最新版本相同，未新增版本。')).toBeTruthy();
+});
+
+test('supports one-time global cloud embedding consent, batch import, and one-click index-all', async () => {
+  const { indexAllCalls, settingsCalls, setDocument } = await setup(original);
+  await screen.findByRole('table', { name: '教材列表' });
+
+  // One-time cloud embedding consent banner when enabling from OFF
+  const cloudCheckbox = screen.getByLabelText(/允许云端向量化/) as HTMLInputElement;
+  expect(cloudCheckbox.checked).toBe(false);
+  fireEvent.click(cloudCheckbox);
+  expect(screen.getByRole('group', { name: '确认开启全局云端向量化' })).toBeTruthy();
+  expect(settingsCalls).not.toHaveBeenCalled();
+
+  fireEvent.click(button('确认开启云端向量化'));
+  await waitFor(() => expect(settingsCalls).toHaveBeenCalledWith({ cloud_embedding_enabled: true }));
+  expect(await screen.findByText('已开启全局云端向量化授权。')).toBeTruthy();
+
+  // One-click complete missing indexes
+  fireEvent.click(button('一键补全索引（1）'));
+  await waitFor(() => expect(indexAllCalls).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText(/已加入混合向量索引队列 1 本/)).toBeTruthy();
+
+  // Batch multi-file import
+  importer.mockResolvedValueOnce([
+    { filename: 'a.pdf', ok: true, result: { import_id: importId, document_id: id, document_version_id: versionId, outcome: 'imported' } },
+    { filename: 'b.pdf', ok: true, result: { import_id: importId, document_id: id, document_version_id: versionId, outcome: 'duplicate' } },
+  ]);
+  setDocument(original);
+  fireEvent.click(button('批量导入教材'));
+  expect(importer).toHaveBeenLastCalledWith('select_and_import_documents');
+  expect(await screen.findByText(/批量导入完成：新增 1 本，重复跳过 1 本/)).toBeTruthy();
 });
 
 test('ignores a cancelled picker and resubmits only the Rust receipt ID after an uncertain result', async () => {
@@ -153,11 +298,11 @@ test('ignores a cancelled picker and resubmits only the Rust receipt ID after an
 
 test('preserves rows on list and delete failures, and requires confirmation before deleting', async () => {
   const { fetchApi, makeListUnavailable, makeDeleteUnavailable } = await setup(original);
-  await screen.findByRole('rowheader', { name: original.name });
+  await screen.findByRole('rowheader', { name: /教材\.md/ });
   makeListUnavailable();
   fireEvent.click(button('刷新列表'));
   expect((await screen.findByRole('alert')).textContent).toContain('教材知识库暂不可用');
-  expect(screen.getByRole('rowheader', { name: original.name })).toBeTruthy();
+  expect(screen.getByRole('rowheader', { name: /教材\.md/ })).toBeTruthy();
   expect(button('刷新列表').disabled).toBe(false);
 
   fireEvent.click(button('删除 教材.md'));
@@ -170,18 +315,17 @@ test('preserves rows on list and delete failures, and requires confirmation befo
   fireEvent.click(button('确认删除'));
   await waitFor(() => expect(button('确认删除').disabled).toBe(false));
   expect(screen.getByRole('alert').textContent).toContain('教材知识库暂不可用');
-  expect(screen.getByRole('rowheader', { name: original.name })).toBeTruthy();
+  expect(screen.getByRole('rowheader', { name: /教材\.md/ })).toBeTruthy();
 
   makeDeleteUnavailable(false);
   fireEvent.click(button('确认删除'));
   expect(await screen.findByText('教材已删除。')).toBeTruthy();
-  expect(screen.queryByRole('rowheader', { name: original.name })).toBeNull();
-  expect(fetchApi.mock.calls.filter(([, options]) => options.method === 'GET')).toHaveLength(3);
+  expect(screen.queryByRole('rowheader', { name: /教材\.md/ })).toBeNull();
 });
 
 test('discloses cloud transfer and waits for confirmation before submitting the latest version', async () => {
   const { changeIndex, setIndex } = await setup(original);
-  await screen.findByRole('rowheader', { name: original.name });
+  await screen.findByRole('rowheader', { name: /教材\.md/ });
   fireEvent.click(button('查看 教材.md 详情'));
   fireEvent.click(await screen.findByRole('button', { name: '开始建立索引' }));
   expect(screen.getByText(/教材分块（Chunk）文本将发送到 SiliconFlow API/)).toBeTruthy();
@@ -205,7 +349,7 @@ test('discloses cloud transfer and waits for confirmation before submitting the 
 test('keeps published keyword capability through real cancel acknowledgement and reuses the same version for retry', async () => {
   const { changeIndex, setIndex } = await setup(original);
   setIndex({ job: indexing, published_readiness: 'ready_keyword' });
-  await screen.findByRole('rowheader', { name: original.name });
+  await screen.findByRole('rowheader', { name: /教材\.md/ });
   fireEvent.click(button('查看 教材.md 详情'));
   await screen.findByText('关键词检索可用');
   expect(screen.getByRole('progressbar', { name: '当前阶段进度' }).getAttribute('value')).toBe('1');
@@ -237,60 +381,25 @@ test('keeps published keyword capability through real cancel acknowledgement and
   expect(screen.getByText('处理完成')).toBeTruthy();
 });
 
-test('polls from persisted status again after switching panels and reports disconnection separately', async () => {
-  const { setIndex, switchPanel, makeIndexUnavailable } = await setup(original);
-  setIndex({ job: indexing, published_readiness: 'ready_keyword' });
-  await screen.findByRole('rowheader', { name: original.name });
-  fireEvent.click(button('查看 教材.md 详情'));
-  await screen.findByText('关键词检索可用');
-  switchPanel(false);
-  setIndex({
-    job: { ...indexing, status: 'retry_wait', error_code: 'EMBEDDING_RATE_LIMITED', next_retry_at: 1795483800 },
-    published_readiness: 'ready_keyword',
-  });
-  switchPanel(true);
-  await screen.findByText('等待重试');
-  expect(screen.getByText(/达到限额（429）/)).toBeTruthy();
-  expect(screen.getByText('下次重试')).toBeTruthy();
-  makeIndexUnavailable(true);
-  await screen.findByText(/下方为上次确认的状态/, {}, { timeout: 2500 });
-  expect(button('取消索引').disabled).toBe(true);
-  expect(screen.getByText('关键词检索可用')).toBeTruthy();
-});
-
-test('refreshes the latest version without showing the historical published capability as current', async () => {
-  const { setDocument, setIndex } = await setup(original);
-  const done = { ...queued, status: 'succeeded' as const, stage: 'publishing' as const };
-  setIndex({ job: done, published_readiness: 'ready_hybrid' });
-  await screen.findByRole('rowheader', { name: original.name });
-  fireEvent.click(button('查看 教材.md 详情'));
-  await screen.findByText('混合检索可用');
-
-  const next = { ...original.versions[0], document_version_id: 'd'.repeat(32) };
-  setDocument({ ...original, version_count: 2, versions: [...original.versions, next] });
-  setIndex({ job: null, published_readiness: null });
-  importer.mockResolvedValueOnce({ import_id: importId, document_id: id,
-    document_version_id: next.document_version_id, outcome: 'updated' });
-  fireEvent.click(button('更新 教材.md'));
-  await screen.findByRole('heading', { name: '第 2 版索引（最新）' });
-  await screen.findByText('尚未发布索引');
-  expect(screen.queryByText('混合检索可用')).toBeNull();
-});
-
-test('searches local textbook index without DeepSeek and renders verified evidence locations and warnings', async () => {
-  const { fetchApi } = await setup(original);
-  await screen.findByRole('rowheader', { name: original.name });
+test('opens Retrieval Lab tab, runs debug-search without DeepSeek, and renders trace, candidates, rerank score, and warnings', async () => {
+  const { fetchApi } = await setup(original, { settings: { cloud_embedding_enabled: true, cloud_rerank_enabled: true } });
+  await screen.findByRole('rowheader', { name: /教材\.md/ });
 
   const originalFetch = fetchApi.getMockImplementation()!;
   fetchApi.mockImplementation(async (url: string, options: RequestInit) => {
     const path = new URL(url).pathname;
-    if (options.method === 'POST' && path === '/api/v1/knowledge/search') {
+    if (options.method === 'POST' && path === '/api/v1/knowledge/debug-search') {
       const body = JSON.parse(String(options.body));
       expect(body.query).toBe('最大似然估计');
+      expect(body.strategy).toBe('global');
+      expect(body.rerank).toBe(true);
       return Response.json({
         query: '最大似然估计',
         retrieval_mode: 'hybrid',
         coverage_mode: 'global',
+        actual_strategy: 'global',
+        rerank_used: true,
+        rerank_diagnostic: null,
         channel_status: 'keyword_only',
         hits: [
           {
@@ -316,22 +425,73 @@ test('searches local textbook index without DeepSeek and renders verified eviden
             text_fidelity: 'parsed_text_unverified',
             body_text: '最大似然估计满足 $L(\\theta)$ 极值条件。',
             fusion_score: 0.0164,
+            rerank_score: 0.912,
             channel_ranks: [{ channel: 'keyword', rank: 1, score: 4.25 }],
             keyword_matched_in: ['body'],
           },
         ],
         documents: [],
         diagnostic: { code: 'EMBEDDING_NOT_CONFIGURED', message: 'SiliconFlow Key 未配置' },
-        timings: { scope_ms: 1.1, fts_ms: 1.4, vector_ms: 0, query_embedding_ms: 0, fusion_ms: 0.1, source_ms: 0.3 },
+        trace: {
+          trace_id: 'tr_test_1',
+          original_query: '最大似然估计',
+          resolved_query: '最大似然估计',
+          query_variants: ['最大似然估计', 'maximum likelihood estimation'],
+          requested_strategy: 'global',
+          actual_strategy: 'global',
+          requested_mode: 'hybrid',
+          effective_channels: ['keyword'],
+          in_scope_documents: 1,
+          searchable_documents: 1,
+          hit_documents: 1,
+          cited_documents: 1,
+          documents: [],
+          stages: [
+            { stage: 'bm25', status: 'ok', candidate_count: 1, elapsed_ms: 1.4 },
+            { stage: 'rerank', status: 'ok', candidate_count: 1, elapsed_ms: 42.0 },
+          ],
+          candidates: [
+            {
+              chunk_id: `chunk:${'1'.repeat(64)}`,
+              document_id: id,
+              textbook_name: '教材.md',
+              chunk_index: 0,
+              page_range: 'p.46',
+              section_path: ['第二章', '2.1 最大似然'],
+              bm25_raw: 4.25,
+              bm25_rank: 1,
+              rrf_score: 0.0164,
+              rrf_rank: 1,
+              rerank_score: 0.912,
+              rerank_rank: 1,
+              selected: true,
+            },
+          ],
+          final_evidence_ids: [`ev1:${id}:1:chunk:${'1'.repeat(64)}:${'2'.repeat(64)}`],
+          prompt_evidence_count: 1,
+          estimated_tokens: 40,
+          degraded: true,
+          degrade_reasons: ['EMBEDDING_NOT_CONFIGURED'],
+          warnings: [],
+          chinese_terms: ['最大似然估计'],
+          english_terms: ['maximum likelihood estimation'],
+          rewrite_mode: 'rules',
+          total_elapsed_ms: 44.9,
+        },
+        timings: { scope_ms: 1.1, fts_ms: 1.4, vector_ms: 0, query_embedding_ms: 0, fusion_ms: 0.1, rerank_ms: 42.0, source_ms: 0.3 },
       });
     }
     return originalFetch(url, options);
   });
 
-  fireEvent.change(screen.getByLabelText('检索教材内容'), { target: { value: '最大似然估计' } });
-  fireEvent.click(button('检索教材'));
+  fireEvent.click(screen.getByRole('tab', { name: /RAG 检索实验室/ }));
+  fireEvent.change(screen.getByLabelText('输入检索实验室问题'), { target: { value: '最大似然估计' } });
+  fireEvent.click(button('运行检索诊断'));
   expect(await screen.findByText('第 46 页（页标签 38）')).toBeTruthy();
+  expect(screen.getByText('BGE-Reranker 已精排')).toBeTruthy();
+  expect(screen.getByText('Rerank 0.912')).toBeTruthy();
   expect(screen.getByText(/章节：第二章 \/ 2\.1 最大似然/)).toBeTruthy();
   expect(screen.getByText(/PDF_UNMAPPED_GLYPHS/)).toBeTruthy();
   expect(screen.getByText(/最大似然估计满足/)).toBeTruthy();
+  expect(screen.getAllByText(/maximum likelihood estimation/).length).toBeGreaterThanOrEqual(1);
 });

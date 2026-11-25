@@ -19,7 +19,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.api.chat import chat_router, run_router
 from app.api.grants import grant_router
-from app.api.index_jobs import index_job_router, index_management_router
+from app.api.index_jobs import index_job_router, index_management_router, index_overview_router
 from app.api.knowledge_search import knowledge_search_router
 from app.api.library import library_router
 from app.api.mcp import mcp_router
@@ -31,6 +31,7 @@ from app.mcp.manager import McpManager
 from app.mcp.process_registry import McpProcessRegistry
 from app.models import ModelError
 from app.models.deepseek import DEEPSEEK_BASE_URL
+from app.models.reranker import SiliconFlowReranker
 from app.models.siliconflow import EMBEDDING_MODEL, MAX_BATCH_SIZE, SiliconFlowEmbedding
 from app.runtime.executor import RuntimeExecutor
 from app.runtime.manager import RuntimeManager
@@ -38,6 +39,7 @@ from app.security import ApiError, require_bearer, validate_tokens
 from app.services.citation_resolver import CitationResolver
 from app.services.document_embeddings import DocumentEmbeddingService
 from app.services.hybrid_retrieval import HybridRetrievalService
+from app.services.index_status import IndexStatusService
 from app.services.index_worker import IndexWorker
 from app.services.keyword_search import KeywordSearchService
 from app.services.knowledge_qa import KnowledgeQAService
@@ -54,6 +56,7 @@ from app.storage.business import DATABASE_NAME, BusinessStore, DatabaseLockedErr
 from app.storage.checkpoints import CHECKPOINT_DATABASE_NAME
 from app.storage.chunks import ChunkStore
 from app.storage.index_jobs import IndexJobStore
+from app.storage.knowledge_settings import KnowledgeSettingsStore
 from app.storage.library import KnowledgeStore, KnowledgeStoreError
 from app.storage.mcp import McpStore
 from app.storage.parsed_documents import ParsedDocumentStore
@@ -232,21 +235,31 @@ def create_app(
                     record("index_configuration_error", error_code="INDEX_BATCH_SIZE_INVALID")
                     document_embeddings = DocumentEmbeddingService(knowledge_store, embeddings)
                 worker = IndexWorker(document_embeddings, instance_id)
+                knowledge_settings = KnowledgeSettingsStore(knowledge_store)
+                index_status = IndexStatusService(knowledge_store, knowledge_settings, worker)
+                reranker = SiliconFlowReranker(embeddings)
                 application.state.knowledge_store = knowledge_store
+                application.state.knowledge_settings = knowledge_settings
                 application.state.library = library
                 application.state.index_jobs = worker.jobs
                 application.state.index_worker = worker
+                application.state.index_status = index_status
                 application.state.document_embeddings = document_embeddings
                 application.state.keyword_search = KeywordSearchService(knowledge_store)
                 application.state.vector_retrieval = VectorRetrievalService(knowledge_store, embeddings)
+                application.state.reranker = reranker
                 application.state.hybrid_retrieval = HybridRetrievalService(
-                    application.state.keyword_search, application.state.vector_retrieval,
+                    application.state.keyword_search,
+                    application.state.vector_retrieval,
+                    reranker=reranker,
                 )
                 application.state.citation_resolver = CitationResolver(knowledge_store)
                 application.state.knowledge_qa = KnowledgeQAService(
                     knowledge_store,
                     application.state.hybrid_retrieval,
                     application.state.citation_resolver,
+                    settings_store=knowledge_settings,
+                    models=models,
                 )
                 runs.knowledge_qa = application.state.knowledge_qa
                 cleanup = asyncio.create_task(clean_library(library, worker.jobs, stop_background))
@@ -288,12 +301,15 @@ def create_app(
                     await worker_task
                 runs.knowledge_qa = None
                 application.state.knowledge_store = None
+                application.state.knowledge_settings = None
                 application.state.library = None
                 application.state.index_jobs = None
                 application.state.index_worker = None
+                application.state.index_status = None
                 application.state.document_embeddings = None
                 application.state.keyword_search = None
                 application.state.vector_retrieval = None
+                application.state.reranker = None
                 application.state.hybrid_retrieval = None
                 application.state.citation_resolver = None
                 application.state.knowledge_qa = None
@@ -307,12 +323,15 @@ def create_app(
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False, lifespan=lifespan)
     app.state.knowledge_store = None
+    app.state.knowledge_settings = None
     app.state.library = None
     app.state.index_jobs = None
     app.state.index_worker = None
+    app.state.index_status = None
     app.state.document_embeddings = None
     app.state.keyword_search = None
     app.state.vector_retrieval = None
+    app.state.reranker = None
     app.state.hybrid_retrieval = None
     app.state.citation_resolver = None
     app.state.knowledge_qa = None
@@ -418,6 +437,7 @@ def create_app(
     app.include_router(knowledge_search_router(require_ui, require_ready))
     app.include_router(index_job_router(HOST_NAMESPACE, require_ready))
     app.include_router(index_management_router(require_ui, require_ready))
+    app.include_router(index_overview_router(require_ui, require_ready))
     app.include_router(mcp_router(HOST_NAMESPACE, require_ui, require_ready))
     app.include_router(workspace_router(HOST_NAMESPACE, require_ui, require_ready))
     app.include_router(runtime_router(HOST_NAMESPACE, require_ui, require_ready))

@@ -15,6 +15,7 @@ from app.models import ModelError
 from app.services.grants import GrantRegistry
 from app.services.hybrid_retrieval import CoverageMode, RetrievalMode
 from app.services.knowledge_qa import KnowledgeQAService
+from app.services.retrieval_trace import RetrievalStrategy, make_failed_trace
 from app.services.models import ModelService
 from app.storage.business import (
     INTERRUPTED_CODE, TERMINAL_STATUSES, BusinessStore, Run, RunStatus, Session, StoredCitation, utc_now,
@@ -39,7 +40,8 @@ class KnowledgeRunConfig:
     document_ids: tuple[str, ...] | None = None
     retrieval_mode: RetrievalMode = "hybrid"
     coverage_mode: CoverageMode = "global"
-    top_k: int = 6
+    strategy: RetrievalStrategy | None = None
+    top_k: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,7 +69,7 @@ class RunNotCancellable(Exception):
 @dataclass(frozen=True)
 class RunEvent:
     type: Literal[
-        "run_started", "message_delta", "run_citations",
+        "run_started", "message_delta", "run_citations", "retrieval_trace",
         "skill_activated", "artifact_created",
         "run_completed", "error", "run_cancelled",
     ] | ToolEvent
@@ -276,6 +278,7 @@ class RunService:
                     "tool_call_id": call_id, "code": "KNOWLEDGE_STORE_UNAVAILABLE", "message": msg,
                 })
                 raise ModelError("KNOWLEDGE_STORE_UNAVAILABLE", msg)
+            retrieval_started = monotonic()
             try:
                 history_messages = await asyncio.to_thread(self._store.list_messages, run.session_id)
                 recent_questions = [
@@ -288,6 +291,7 @@ class RunService:
                     document_ids=knowledge.document_ids,
                     retrieval_mode=knowledge.retrieval_mode,
                     coverage_mode=knowledge.coverage_mode,
+                    strategy=knowledge.strategy,
                     top_k=knowledge.top_k,
                 )
             except asyncio.CancelledError:
@@ -299,13 +303,66 @@ class RunService:
                 })
                 raise
             except ModelError as error:
+                elapsed_ms = (monotonic() - retrieval_started) * 1000
+                failed_trace = make_failed_trace(
+                    message,
+                    requested_strategy=knowledge.strategy or ("compare" if knowledge.coverage_mode == "per_document" else "global"),
+                    requested_mode=knowledge.retrieval_mode,
+                    error_code=error.code,
+                    error_message=str(error),
+                    elapsed_ms=elapsed_ms,
+                )
+                await self._persist_and_emit_trace(run, stream, failed_trace)
+                record(
+                    "knowledge_retrieval_error", run_id=run.run_id, session_id=run.session_id,
+                    error_code=error.code, exception_type=type(error).__name__,
+                )
                 await asyncio.to_thread(self._store.finish_tool, run, call_id, "failed", str(error), error.code)
                 stream.on_tool_event("tool_failed", {
                     "tool_call_id": call_id, "code": error.code, "message": str(error),
                 })
                 raise
-            except Exception:
-                msg = "教材知识库检索失败。"
+            except ValueError as error:
+                elapsed_ms = (monotonic() - retrieval_started) * 1000
+                msg = f"教材检索参数无效：{error}"
+                failed_trace = make_failed_trace(
+                    message,
+                    requested_strategy=knowledge.strategy or ("compare" if knowledge.coverage_mode == "per_document" else "global"),
+                    requested_mode=knowledge.retrieval_mode,
+                    error_code="KNOWLEDGE_INVALID_SCOPE",
+                    error_message=msg,
+                    elapsed_ms=elapsed_ms,
+                )
+                await self._persist_and_emit_trace(run, stream, failed_trace)
+                record(
+                    "knowledge_retrieval_error", run_id=run.run_id, session_id=run.session_id,
+                    error_code="KNOWLEDGE_INVALID_SCOPE", exception_type="ValueError",
+                    detail=str(error)[:200],
+                )
+                await asyncio.to_thread(
+                    self._store.finish_tool, run, call_id, "failed", msg, "KNOWLEDGE_INVALID_SCOPE",
+                )
+                stream.on_tool_event("tool_failed", {
+                    "tool_call_id": call_id, "code": "KNOWLEDGE_INVALID_SCOPE", "message": msg,
+                })
+                raise ModelError("KNOWLEDGE_INVALID_SCOPE", msg) from None
+            except Exception as error:
+                elapsed_ms = (monotonic() - retrieval_started) * 1000
+                msg = f"教材知识库检索失败（{type(error).__name__}）。"
+                failed_trace = make_failed_trace(
+                    message,
+                    requested_strategy=knowledge.strategy or ("compare" if knowledge.coverage_mode == "per_document" else "global"),
+                    requested_mode=knowledge.retrieval_mode,
+                    error_code="HYBRID_QUERY_FAILED",
+                    error_message=msg,
+                    elapsed_ms=elapsed_ms,
+                )
+                await self._persist_and_emit_trace(run, stream, failed_trace)
+                record(
+                    "knowledge_retrieval_error", run_id=run.run_id, session_id=run.session_id,
+                    error_code="HYBRID_QUERY_FAILED", exception_type=type(error).__name__,
+                    detail=str(error)[:200],
+                )
                 await asyncio.to_thread(
                     self._store.finish_tool, run, call_id, "failed", msg, "HYBRID_QUERY_FAILED",
                 )
@@ -317,11 +374,16 @@ class RunService:
             await asyncio.to_thread(self._store.finish_tool, run, call_id, "completed", rag_ctx.summary, None)
             stream.on_tool_event("tool_completed", {"tool_call_id": call_id, "summary": rag_ctx.summary})
             stream.citations = rag_ctx.citations
+            if rag_ctx.trace is not None:
+                await self._persist_and_emit_trace(run, stream, rag_ctx.trace)
             stream.publish(RunEvent("run_citations", {
                 "citations": [asdict(c) for c in rag_ctx.citations],
                 "retrieval_query": rag_ctx.retrieval_query,
                 "coverage_mode": rag_ctx.coverage_mode,
+                "actual_strategy": rag_ctx.actual_strategy,
                 "channel_status": rag_ctx.channel_status,
+                "degraded": rag_ctx.trace.degraded if rag_ctx.trace else False,
+                "degrade_reasons": list(rag_ctx.trace.degrade_reasons) if rag_ctx.trace else [],
             }))
             system_prompt = rag_ctx.system_prompt
 
@@ -493,6 +555,27 @@ class RunService:
             # A cancellation accepted while the model was still active can win the database race.
             if await asyncio.to_thread(self._store.confirm_cancel, run):
                 return RunEvent("run_cancelled", {"reason": "user_requested"})
+
+    async def _persist_and_emit_trace(self, run: Run, stream: RunStream, trace) -> None:
+        summary = trace.to_summary_dict()
+        compact = trace.to_compact_dict()
+        try:
+            await asyncio.to_thread(
+                self._store.save_retrieval_trace,
+                run.session_id,
+                run.run_id,
+                summary=summary,
+                trace=compact,
+                trace_version=trace.schema_version,
+            )
+        except Exception:
+            record("retrieval_trace_persist_error", run_id=run.run_id, session_id=run.session_id)
+        stream.publish(RunEvent("retrieval_trace", {"summary": summary, "trace": compact}))
+
+    async def get_retrieval_trace(self, run_id: str) -> dict[str, Any] | None:
+        # Verify run exists first
+        await asyncio.to_thread(self._store.get_run, run_id)
+        return await asyncio.to_thread(self._store.get_retrieval_trace, run_id)
 
     async def _fail(self, run: Run, code: str, message: str) -> RunEvent | None:
         if await asyncio.to_thread(self._store.fail_run, run, code, message):

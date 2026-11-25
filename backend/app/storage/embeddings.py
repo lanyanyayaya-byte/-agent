@@ -75,6 +75,11 @@ class EmbeddingStore:
         token = uuid4().hex
         return f"index:{claim.lease_token}:{token}" if claim is not None else token
 
+    def count_embedded(self, set_id: int, profile: EmbeddingProfile) -> int:
+        with self.store.connect() as db:
+            row = db.execute(f"SELECT count(*) FROM ({SAVED_CHUNKS})", (set_id, profile.key)).fetchone()
+            return int(row[0]) if row else 0
+
     def get_ready(self, set_id: int, profile: EmbeddingProfile) -> EmbeddingSet | None:
         key = profile.key
         with self.store.connect() as db, db:

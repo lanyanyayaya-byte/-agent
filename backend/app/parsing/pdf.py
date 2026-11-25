@@ -14,7 +14,7 @@ from app.services.library import MAX_FILE_BYTES
 
 WORKER_TIMEOUT_SECONDS = 300
 WORKER_MEMORY_BYTES = 1024 * 1024 * 1024
-MAX_RESULT_BYTES = 16 * 1024 * 1024
+MAX_RESULT_BYTES = 32 * 1024 * 1024
 WORKER_SLOT = BoundedSemaphore()
 ERRORS = {
     "PDF_ENCRYPTED": "The PDF is encrypted.",

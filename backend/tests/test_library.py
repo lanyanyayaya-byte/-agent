@@ -32,7 +32,7 @@ KEYWORD_TABLES = {
     "keyword_fts_data", "keyword_fts_idx", "keyword_fts_docsize", "keyword_fts_config",
 }
 KNOWLEDGE_TABLES = (
-    {"documents", "document_versions", "content_blobs", "knowledge_imports", "index_jobs"}
+    {"documents", "document_versions", "content_blobs", "knowledge_imports", "index_jobs", "knowledge_settings"}
     | PARSED_TABLES | CHUNK_TABLES | EMBEDDING_TABLES | KEYWORD_TABLES
 )
 

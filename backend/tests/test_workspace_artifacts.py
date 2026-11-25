@@ -99,9 +99,9 @@ def test_v6_to_v7_migration_preserves_all_data_and_rolls_back_on_error(tmp_path)
 
     # Now perform real V6 -> V7 upgrade
     store = BusinessStore(path)
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
     with closing(store._connect()) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (7,)
+        assert db.execute("PRAGMA user_version").fetchone() == (8,)
         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         mcp_count = db.execute("SELECT count(*) FROM mcp_servers WHERE server_id = 'srv-v6'").fetchone()[0]

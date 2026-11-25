@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 from app.storage.chunks import PUBLISHED_SETS
-from app.storage.keyword_terms import fts_phrase, keyword_terms
+from app.storage.keyword_terms import (
+    build_bm25_or_query, fts_phrase, is_explicit_exact_query, keyword_terms, looks_like_natural_language,
+)
 from app.storage.keywords import COMPLETE_KEYWORD_ROWS, KeywordIndex, KeywordIndexError
 from app.storage.library import KnowledgeStore
 from app.storage.retrieval_scope import CURRENT_VERSION, LATEST_PER_DOCUMENT, scope_filters
@@ -86,8 +88,21 @@ def prepare_keyword_query(query: str) -> str | None:
         ord(char) == 0 or 0xD800 <= ord(char) <= 0xDFFF for char in query
     ):
         raise ValueError("Invalid keyword query.")
-    terms = keyword_terms(query)
+    stripped = query.strip()
+    if len(stripped) >= 3 and (
+        (stripped.startswith('"') and stripped.endswith('"'))
+        or (stripped.startswith("“") and stripped.endswith("”"))
+    ):
+        stripped = stripped[1:-1]
+    terms = keyword_terms(stripped)
     return fts_phrase(terms) if any(char.isalnum() for char in terms) else None
+
+
+def _column_match_expr(column: str, expr: str) -> str:
+    # Wrap OR expressions in parentheses so FTS5 binds the column filter to every term.
+    if " OR " in expr:
+        return f"{column} : ({expr})"
+    return f"{column} : {expr}"
 
 
 class KeywordSearchService:
@@ -96,7 +111,9 @@ class KeywordSearchService:
         self.index = KeywordIndex(store)
 
     def search(self, query: str, top_k: int = 10, *, document_ids: Sequence[str] | None = None,
-               chunk_set_ids: Sequence[int] | None = None) -> tuple[KeywordHit, ...]:
+               chunk_set_ids: Sequence[int] | None = None,
+               exact_phrase: bool | None = None,
+               extra_terms: Sequence[str] = ()) -> tuple[KeywordHit, ...]:
         """Search one complete set per selected textbook in a single read snapshot.
 
         An explicit set filter pins versions. Otherwise search only the latest
@@ -112,21 +129,81 @@ class KeywordSearchService:
             filter_sql += CURRENT_VERSION
         eligible = f"{SELECT_SETS}{filter_sql}"
         scope = LATEST_PER_DOCUMENT if chunk_set_ids is None else "SELECT * FROM eligible"
+        force_exact = exact_phrase if exact_phrase is not None else is_explicit_exact_query(query)
 
         with self.store.connect() as db, db:
             db.execute("BEGIN")
-            return self._search_scope(db, phrase, top_k, eligible, values, scope,
-                                      check_unique=chunk_set_ids is not None)
+            exact_hits = self._search_scope(db, phrase, top_k, eligible, values, scope,
+                                            check_unique=chunk_set_ids is not None)
+            if force_exact:
+                return exact_hits
+            if exact_hits and not extra_terms and not looks_like_natural_language(query):
+                return exact_hits
+            or_expr = build_bm25_or_query(query, extra_terms=tuple(extra_terms))
+            if or_expr is None or or_expr == phrase:
+                return exact_hits
+            or_hits = self._search_scope(db, or_expr, top_k, eligible, values, scope,
+                                         check_unique=chunk_set_ids is not None)
+            if not exact_hits:
+                return or_hits
+            return self._merge_hits(exact_hits, or_hits, top_k)
 
     def search_indexed(self, db: sqlite3.Connection, phrase: str | None, limit: int,
-                       set_ids: Sequence[int]) -> tuple[KeywordHit, ...]:
+                       set_ids: Sequence[int], *, raw_query: str | None = None,
+                       exact_phrase: bool = False,
+                       extra_terms: Sequence[str] = ()) -> tuple[KeywordHit, ...]:
         """Search exact, already selected sets within the caller's read snapshot."""
         if phrase is None or not set_ids:
             return ()
         if type(limit) is not int or not 1 <= limit <= MAX_CANDIDATES:
             raise ValueError("Invalid keyword candidate limit.")
         eligible = f"{SELECT_SETS} AND s.chunk_set_id IN (SELECT value FROM json_each(?))"
-        return self._search_scope(db, phrase, limit, eligible, (json.dumps(set_ids),), "SELECT * FROM eligible")
+        values = (json.dumps(set_ids),)
+        exact_hits = self._search_scope(db, phrase, limit, eligible, values, "SELECT * FROM eligible")
+        if exact_phrase or raw_query is None or is_explicit_exact_query(raw_query):
+            return exact_hits
+        if exact_hits and not extra_terms and not looks_like_natural_language(raw_query):
+            return exact_hits
+        or_expr = build_bm25_or_query(raw_query, extra_terms=tuple(extra_terms))
+        if or_expr is None or or_expr == phrase:
+            return exact_hits
+        or_hits = self._search_scope(db, or_expr, limit, eligible, values, "SELECT * FROM eligible")
+        if not exact_hits:
+            return or_hits
+        return self._merge_hits(exact_hits, or_hits, limit)
+
+    @staticmethod
+    def needs_bm25_expansion(query: str) -> bool:
+        return not is_explicit_exact_query(query) and looks_like_natural_language(query)
+
+    def search_bm25_or_indexed(
+        self,
+        db: sqlite3.Connection,
+        raw_query: str,
+        limit: int,
+        set_ids: Sequence[int],
+        *,
+        extra_terms: Sequence[str] = (),
+    ) -> tuple[KeywordHit, ...]:
+        if not set_ids or is_explicit_exact_query(raw_query):
+            return ()
+        or_expr = build_bm25_or_query(raw_query, extra_terms=tuple(extra_terms))
+        if or_expr is None:
+            return ()
+        eligible = f"{SELECT_SETS} AND s.chunk_set_id IN (SELECT value FROM json_each(?))"
+        return self._search_scope(db, or_expr, limit, eligible, (json.dumps(set_ids),), "SELECT * FROM eligible")
+
+    @staticmethod
+    def _merge_hits(primary: tuple[KeywordHit, ...], secondary: tuple[KeywordHit, ...], limit: int) -> tuple[KeywordHit, ...]:
+        merged: list[KeywordHit] = list(primary)
+        seen = {hit.chunk_id for hit in primary}
+        for hit in secondary:
+            if hit.chunk_id not in seen:
+                seen.add(hit.chunk_id)
+                merged.append(hit)
+                if len(merged) >= limit:
+                    break
+        return tuple(merged[:limit])
 
     @staticmethod
     def _search_scope(db, phrase, limit, eligible, values, scope, *, check_unique=False):
@@ -145,7 +222,8 @@ class KeywordSearchService:
                 raise ValueError("Keyword search requires one indexed Chunk Set per textbook.")
             rows = db.execute(
                 f"{cte}, scope AS MATERIALIZED ({scope}), {RANKED_SEARCH}",
-                (*values, phrase, MAX_CANDIDATES, limit, f"body : {phrase}", f"title : {phrase}"),
+                (*values, phrase, MAX_CANDIDATES, limit,
+                 _column_match_expr("body", phrase), _column_match_expr("title", phrase)),
             ).fetchall()
         except sqlite3.DatabaseError as error:
             if error.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:

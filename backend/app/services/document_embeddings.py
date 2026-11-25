@@ -27,13 +27,18 @@ class DocumentEmbeddingService:
         return self.results.read_vectors(set_id, profile)
 
     async def ensure_embedded(self, set_id: int, profile: EmbeddingProfile, *,
-                              claim: IndexJobClaim | None = None) -> EmbeddingSet:
+                              claim: IndexJobClaim | None = None,
+                              progress_total: int | None = None) -> EmbeddingSet:
         self.provider.check_profile(profile)
         ready = await run_index_sync(self.results.get_ready, set_id, profile)
         if ready is not None:
             return ready
         await run_index_sync(self.results.stage, set_id, profile, claim=claim)
         cursor = -1
+        jobs = None
+        if claim is not None and progress_total is not None and progress_total > 0:
+            from app.storage.index_jobs import IndexJobStore
+            jobs = IndexJobStore(self.results.store)
         async with AsyncExitStack() as stack:
             client = None
             while rows := await run_index_sync(self.results.missing_chunks, set_id, profile, cursor, self.batch_size):
@@ -47,6 +52,12 @@ class DocumentEmbeddingService:
                         batch = await self.provider.embed(client, [entry.text for entry in missing], profile=profile)
                         await run_index_sync(
                             self.results.commit, set_id, batch.profile, lease, missing, batch.vectors, claim=claim,
+                        )
+                    if jobs is not None and claim is not None and progress_total is not None:
+                        done = await run_index_sync(self.results.count_embedded, set_id, profile)
+                        await run_index_sync(
+                            jobs.update_progress, claim, "embedding",
+                            completed_work=min(done, progress_total), total_work=progress_total,
                         )
                 except BaseException as error:
                     try:
