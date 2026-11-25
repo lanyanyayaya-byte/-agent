@@ -1,0 +1,9 @@
+{
+  "build": { "features": ["sidecar-onefile"] },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "macOS": { "minimumSystemVersion": "11.0", "signingIdentity": "-" },
+    "externalBin": ["target/packaging/pyinstaller/onefile/knowledgeagent-sidecar"]
+  }
+}

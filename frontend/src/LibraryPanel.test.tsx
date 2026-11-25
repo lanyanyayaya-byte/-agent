@@ -1,0 +1,337 @@
+// @vitest-environment jsdom
+
+import { invoke } from '@tauri-apps/api/core';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, expect, test, vi } from 'vitest';
+import LibraryPanel from './LibraryPanel';
+import { connectApiClient, type DocumentDetails, type DocumentIndex, type IndexJobState } from './api/apiClient';
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+
+afterEach(() => {
+  cleanup();
+  vi.resetAllMocks();
+  vi.unstubAllGlobals();
+});
+
+const id = 'a'.repeat(32);
+const importId = 'bf644ca9-bd5f-4cd9-af10-15603dbccf1e';
+const date = '2026-11-22T08:30:00Z';
+const original = {
+  document_id: id, name: '教材.md', format: 'md', management_status: 'imported',
+  created_at: date, updated_at: date, version_count: 1, latest_size_bytes: 9,
+  versions: [{ document_version_id: 'b'.repeat(32), size_bytes: 9, content_sha256: 'c'.repeat(64), created_at: date }],
+} satisfies DocumentDetails;
+const documentsPath = '/api/v1/knowledge/documents';
+const importer = vi.mocked(invoke);
+const versionId = original.versions[0].document_version_id;
+const jobPath = `${documentsPath}/${id}/versions/${versionId}/index-jobs`;
+const queued: IndexJobState = {
+  job_id: 'e'.repeat(32), document_id: id, document_version_id: versionId, status: 'queued', stage: 'parsing',
+  completed_work: 0, total_work: null, error_code: null, retry_count: 0, next_retry_at: null, cancel_requested_at: null,
+};
+const indexing: IndexJobState = { ...queued, status: 'running', stage: 'embedding', completed_work: 1, total_work: 3 };
+
+function textbookUnavailable() {
+  return Response.json({ error: { code: 'KNOWLEDGE_STORE_UNAVAILABLE', message: 'internal detail' } }, { status: 503 });
+}
+
+async function setup(initial?: DocumentDetails) {
+  let document = initial;
+  let listUnavailable = false;
+  let deleteUnavailable = false;
+  let indexUnavailable = false;
+  let index: Pick<DocumentIndex, 'job' | 'published_readiness'> = { job: null, published_readiness: null };
+  const changeIndex = vi.fn<(_: string, __: RequestInit) => Response | Promise<Response>>();
+  importer.mockResolvedValueOnce({ base_url: 'http://127.0.0.1:8766', ui_token: 'ui-test' });
+  const fetchApi = vi.fn(async (url: string, options: RequestInit) => {
+    expect(options.headers).toMatchObject({ Authorization: 'Bearer ui-test' });
+    const path = new URL(url).pathname;
+    if (options.method === 'GET' && path === documentsPath) {
+      if (listUnavailable) return textbookUnavailable();
+      if (!document) return Response.json([]);
+      const { versions, ...summary } = document;
+      return Response.json([summary]);
+    }
+    if (options.method === 'GET' && path === `${documentsPath}/${id}`) return Response.json(document);
+    if (options.method === 'GET' && path === `${documentsPath}/${id}/index`) {
+      if (indexUnavailable) return textbookUnavailable();
+      return Response.json({
+        document_id: id, document_version_id: document?.versions.at(-1)?.document_version_id,
+        ...index,
+      });
+    }
+    if (options.method === 'POST' && path.startsWith(jobPath)) return changeIndex(path, options);
+    if (options.method === 'POST' && path === `${documentsPath}/${id}/delete`) {
+      if (deleteUnavailable) return textbookUnavailable();
+      document = undefined;
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`Unexpected request ${options.method} ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchApi);
+  const client = await connectApiClient();
+  const view = render(<LibraryPanel client={client} active />);
+  return {
+    fetchApi, changeIndex, setDocument(value: DocumentDetails) { document = value; },
+    setIndex(value: typeof index) { index = value; },
+    makeIndexUnavailable(value: boolean) { indexUnavailable = value; },
+    switchPanel(active: boolean) { view.rerender(<LibraryPanel client={client} active={active} />); },
+    makeListUnavailable() { listUnavailable = true; },
+    makeDeleteUnavailable(value: boolean) { deleteUnavailable = value; },
+  };
+}
+
+function button(name: string) {
+  return screen.getByRole<HTMLButtonElement>('button', { name });
+}
+
+test('imports, shows distinct outcomes, and refreshes the list and open history after an update', async () => {
+  const { setDocument } = await setup();
+  await screen.findByText(/还没有教材/);
+  const importPending = Promise.withResolvers<unknown>();
+  importer.mockReturnValueOnce(importPending.promise);
+  fireEvent.click(button('导入教材'));
+  expect(button('导入教材').disabled).toBe(true);
+  expect(screen.getByText('正在导入教材…')).toBeTruthy();
+  expect(importer).toHaveBeenLastCalledWith('select_and_import_document', { request: { action: 'select' } });
+
+  const receipt = { import_id: importId, document_id: id, document_version_id: original.versions[0].document_version_id };
+  setDocument(original);
+  importPending.resolve({ ...receipt, outcome: 'imported' });
+  expect(await screen.findByText('教材已导入。')).toBeTruthy();
+  let table = within(await screen.findByRole('table', { name: '教材列表' }));
+  expect(table.getByRole('cell', { name: '9 B' })).toBeTruthy();
+  expect(table.getByRole('cell', { name: '已导入' })).toBeTruthy();
+  await screen.findByRole('button', { name: '开始建立索引' });
+  await screen.findByRole('heading', { name: '版本历史（1）' });
+
+  importer.mockResolvedValueOnce({ ...receipt, outcome: 'duplicate' });
+  fireEvent.click(button('导入教材'));
+  expect(await screen.findByText(/此文件内容已在教材库中/)).toBeTruthy();
+  expect(table.getAllByRole('row')).toHaveLength(2);
+
+  const next = { ...original.versions[0], document_version_id: 'd'.repeat(32), size_bytes: 20 };
+  setDocument({ ...original, version_count: 2, latest_size_bytes: next.size_bytes, versions: [...original.versions, next] });
+  importer.mockResolvedValueOnce({ ...receipt, document_version_id: next.document_version_id, outcome: 'updated' });
+  fireEvent.click(button('更新 教材.md'));
+  expect(importer).toHaveBeenLastCalledWith('select_and_import_document', {
+    request: { action: 'select', document_id: id },
+  });
+  expect(await screen.findByText('教材已更新，新增一个版本。')).toBeTruthy();
+  await screen.findByRole('heading', { name: '版本历史（2）' });
+  table = within(screen.getByRole('table', { name: '教材列表' }));
+  expect(table.getByRole('cell', { name: '20 B' })).toBeTruthy();
+  expect(table.getByRole('cell', { name: '2' })).toBeTruthy();
+
+  importer.mockResolvedValueOnce({ ...receipt, document_version_id: next.document_version_id, outcome: 'unchanged' });
+  fireEvent.click(button('更新 教材.md'));
+  expect(await screen.findByText('文件内容与最新版本相同，未新增版本。')).toBeTruthy();
+});
+
+test('ignores a cancelled picker and resubmits only the Rust receipt ID after an uncertain result', async () => {
+  const { fetchApi } = await setup();
+  await screen.findByText(/还没有教材/);
+  importer.mockResolvedValueOnce(null);
+  await act(async () => fireEvent.click(button('导入教材')));
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(button('导入教材').disabled).toBe(false);
+  expect(fetchApi).toHaveBeenCalledTimes(1);
+
+  importer.mockRejectedValueOnce({ code: 'KNOWLEDGE_STORE_UNAVAILABLE', import_id: importId });
+  fireEvent.click(button('导入教材'));
+  expect((await screen.findByRole('alert')).textContent).toContain('教材知识库暂不可用');
+  expect(button('导入教材').disabled).toBe(true);
+  importer.mockRejectedValueOnce({ code: 'IMPORT_RETRY_NOT_FOUND' });
+  fireEvent.click(button('重试本次导入'));
+  expect(importer).toHaveBeenLastCalledWith('select_and_import_document', {
+    request: { action: 'retry', import_id: importId },
+  });
+  await screen.findByText(/暂存记录已失效/);
+  expect(button('导入教材').disabled).toBe(false);
+});
+
+test('preserves rows on list and delete failures, and requires confirmation before deleting', async () => {
+  const { fetchApi, makeListUnavailable, makeDeleteUnavailable } = await setup(original);
+  await screen.findByRole('rowheader', { name: original.name });
+  makeListUnavailable();
+  fireEvent.click(button('刷新列表'));
+  expect((await screen.findByRole('alert')).textContent).toContain('教材知识库暂不可用');
+  expect(screen.getByRole('rowheader', { name: original.name })).toBeTruthy();
+  expect(button('刷新列表').disabled).toBe(false);
+
+  fireEvent.click(button('删除 教材.md'));
+  expect(fetchApi.mock.calls.some(([, options]) => options.method === 'POST')).toBe(false);
+  fireEvent.click(button('取消删除'));
+  expect(screen.queryByRole('button', { name: '确认删除' })).toBeNull();
+
+  makeDeleteUnavailable(true);
+  fireEvent.click(button('删除 教材.md'));
+  fireEvent.click(button('确认删除'));
+  await waitFor(() => expect(button('确认删除').disabled).toBe(false));
+  expect(screen.getByRole('alert').textContent).toContain('教材知识库暂不可用');
+  expect(screen.getByRole('rowheader', { name: original.name })).toBeTruthy();
+
+  makeDeleteUnavailable(false);
+  fireEvent.click(button('确认删除'));
+  expect(await screen.findByText('教材已删除。')).toBeTruthy();
+  expect(screen.queryByRole('rowheader', { name: original.name })).toBeNull();
+  expect(fetchApi.mock.calls.filter(([, options]) => options.method === 'GET')).toHaveLength(3);
+});
+
+test('discloses cloud transfer and waits for confirmation before submitting the latest version', async () => {
+  const { changeIndex, setIndex } = await setup(original);
+  await screen.findByRole('rowheader', { name: original.name });
+  fireEvent.click(button('查看 教材.md 详情'));
+  fireEvent.click(await screen.findByRole('button', { name: '开始建立索引' }));
+  expect(screen.getByText(/教材分块（Chunk）文本将发送到 SiliconFlow API/)).toBeTruthy();
+  expect(changeIndex).not.toHaveBeenCalled();
+  fireEvent.click(button('暂不提交'));
+  expect(changeIndex).not.toHaveBeenCalled();
+
+  changeIndex.mockImplementation((path, options) => {
+    expect(path).toBe(jobPath);
+    expect(JSON.parse(options.body as string)).toEqual({ allow_cloud_embedding: true });
+    setIndex({ job: queued, published_readiness: null });
+    return Response.json(queued);
+  });
+  fireEvent.click(button('开始建立索引'));
+  fireEvent.click(button('同意并提交索引'));
+  await screen.findByText('等待处理');
+  expect(screen.getByRole('progressbar', { name: '当前阶段进度未确定' }).getAttribute('value')).toBeNull();
+  expect(changeIndex).toHaveBeenCalledTimes(1);
+});
+
+test('keeps published keyword capability through real cancel acknowledgement and reuses the same version for retry', async () => {
+  const { changeIndex, setIndex } = await setup(original);
+  setIndex({ job: indexing, published_readiness: 'ready_keyword' });
+  await screen.findByRole('rowheader', { name: original.name });
+  fireEvent.click(button('查看 教材.md 详情'));
+  await screen.findByText('关键词检索可用');
+  expect(screen.getByRole('progressbar', { name: '当前阶段进度' }).getAttribute('value')).toBe('1');
+  expect(screen.getByText('当前阶段 1 / 3')).toBeTruthy();
+  const mutation = Promise.withResolvers<Response>();
+  changeIndex.mockImplementationOnce(() => mutation.promise);
+  fireEvent.click(button('取消索引'));
+  expect(screen.getByText('正在请求取消…')).toBeTruthy();
+  expect(screen.queryByText('任务已取消')).toBeNull();
+  const cancelling = { ...indexing, cancel_requested_at: 1795483800 };
+  setIndex({ job: cancelling, published_readiness: 'ready_keyword' });
+  mutation.resolve(Response.json(cancelling));
+  await screen.findByText('正在取消');
+  expect(button('取消索引').disabled).toBe(true);
+  expect(screen.getByText('关键词检索可用')).toBeTruthy();
+
+  setIndex({ job: { ...cancelling, status: 'cancelled' }, published_readiness: 'ready_keyword' });
+  await screen.findByText('任务已取消', {}, { timeout: 2500 });
+  changeIndex.mockImplementationOnce((path, options) => {
+    expect(path).toBe(`${jobPath}/${queued.job_id}/retry`);
+    expect(JSON.parse(options.body as string)).toEqual({ allow_cloud_embedding: true });
+    const done = { ...queued, job_id: 'f'.repeat(32), status: 'succeeded' as const, stage: 'publishing' as const };
+    setIndex({ job: done, published_readiness: 'ready_hybrid' });
+    return Response.json(done);
+  });
+  fireEvent.click(button('重试索引'));
+  fireEvent.click(button('同意并提交索引'));
+  await screen.findByText('混合检索可用');
+  expect(screen.getByText('处理完成')).toBeTruthy();
+});
+
+test('polls from persisted status again after switching panels and reports disconnection separately', async () => {
+  const { setIndex, switchPanel, makeIndexUnavailable } = await setup(original);
+  setIndex({ job: indexing, published_readiness: 'ready_keyword' });
+  await screen.findByRole('rowheader', { name: original.name });
+  fireEvent.click(button('查看 教材.md 详情'));
+  await screen.findByText('关键词检索可用');
+  switchPanel(false);
+  setIndex({
+    job: { ...indexing, status: 'retry_wait', error_code: 'EMBEDDING_RATE_LIMITED', next_retry_at: 1795483800 },
+    published_readiness: 'ready_keyword',
+  });
+  switchPanel(true);
+  await screen.findByText('等待重试');
+  expect(screen.getByText(/达到限额（429）/)).toBeTruthy();
+  expect(screen.getByText('下次重试')).toBeTruthy();
+  makeIndexUnavailable(true);
+  await screen.findByText(/下方为上次确认的状态/, {}, { timeout: 2500 });
+  expect(button('取消索引').disabled).toBe(true);
+  expect(screen.getByText('关键词检索可用')).toBeTruthy();
+});
+
+test('refreshes the latest version without showing the historical published capability as current', async () => {
+  const { setDocument, setIndex } = await setup(original);
+  const done = { ...queued, status: 'succeeded' as const, stage: 'publishing' as const };
+  setIndex({ job: done, published_readiness: 'ready_hybrid' });
+  await screen.findByRole('rowheader', { name: original.name });
+  fireEvent.click(button('查看 教材.md 详情'));
+  await screen.findByText('混合检索可用');
+
+  const next = { ...original.versions[0], document_version_id: 'd'.repeat(32) };
+  setDocument({ ...original, version_count: 2, versions: [...original.versions, next] });
+  setIndex({ job: null, published_readiness: null });
+  importer.mockResolvedValueOnce({ import_id: importId, document_id: id,
+    document_version_id: next.document_version_id, outcome: 'updated' });
+  fireEvent.click(button('更新 教材.md'));
+  await screen.findByRole('heading', { name: '第 2 版索引（最新）' });
+  await screen.findByText('尚未发布索引');
+  expect(screen.queryByText('混合检索可用')).toBeNull();
+});
+
+test('searches local textbook index without DeepSeek and renders verified evidence locations and warnings', async () => {
+  const { fetchApi } = await setup(original);
+  await screen.findByRole('rowheader', { name: original.name });
+
+  const originalFetch = fetchApi.getMockImplementation()!;
+  fetchApi.mockImplementation(async (url: string, options: RequestInit) => {
+    const path = new URL(url).pathname;
+    if (options.method === 'POST' && path === '/api/v1/knowledge/search') {
+      const body = JSON.parse(String(options.body));
+      expect(body.query).toBe('最大似然估计');
+      return Response.json({
+        query: '最大似然估计',
+        retrieval_mode: 'hybrid',
+        coverage_mode: 'global',
+        channel_status: 'keyword_only',
+        hits: [
+          {
+            evidence_id: `ev1:${id}:1:chunk:${'1'.repeat(64)}:${'2'.repeat(64)}`,
+            chunk_id: `chunk:${'1'.repeat(64)}`,
+            chunk_set_id: 1,
+            chunk_index: 0,
+            document_id: id,
+            document_version_id: versionId,
+            textbook_name: '教材.md',
+            format: 'pdf',
+            section_path: ['第二章', '2.1 最大似然'],
+            location_summary: '第 46 页（页标签 38）',
+            location_precision: 'block',
+            location_status: 'available',
+            physical_pages: [46],
+            page_labels: ['38'],
+            line_range: null,
+            paragraph_numbers: [],
+            warnings: [{ code: 'PDF_UNMAPPED_GLYPHS', message: 'Unmapped math glyphs', physical_page: 46 }],
+            historical: false,
+            parse_spec_current: true,
+            text_fidelity: 'parsed_text_unverified',
+            body_text: '最大似然估计满足 $L(\\theta)$ 极值条件。',
+            fusion_score: 0.0164,
+            channel_ranks: [{ channel: 'keyword', rank: 1, score: 4.25 }],
+            keyword_matched_in: ['body'],
+          },
+        ],
+        documents: [],
+        diagnostic: { code: 'EMBEDDING_NOT_CONFIGURED', message: 'SiliconFlow Key 未配置' },
+        timings: { scope_ms: 1.1, fts_ms: 1.4, vector_ms: 0, query_embedding_ms: 0, fusion_ms: 0.1, source_ms: 0.3 },
+      });
+    }
+    return originalFetch(url, options);
+  });
+
+  fireEvent.change(screen.getByLabelText('检索教材内容'), { target: { value: '最大似然估计' } });
+  fireEvent.click(button('检索教材'));
+  expect(await screen.findByText('第 46 页（页标签 38）')).toBeTruthy();
+  expect(screen.getByText(/章节：第二章 \/ 2\.1 最大似然/)).toBeTruthy();
+  expect(screen.getByText(/PDF_UNMAPPED_GLYPHS/)).toBeTruthy();
+  expect(screen.getByText(/最大似然估计满足/)).toBeTruthy();
+});

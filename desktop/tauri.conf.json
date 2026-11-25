@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "KnowledgeAgent",
+  "version": "0.1.0",
+  "identifier": "local.knowledgeagent.desktop",
+  "build": {
+    "beforeDevCommand": { "script": "pnpm dev", "cwd": "../frontend" },
+    "beforeBuildCommand": { "script": "pnpm build", "cwd": "../frontend" },
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      { "label": "main", "title": "KnowledgeAgent", "width": 1180, "height": 780 }
+    ],
+    "security": {
+      "capabilities": ["main-connection"],
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "dmg": {
+        "background": "packaging/dmg-background.png",
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 }
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+[project]
+name = "knowledgeagent-backend"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aiosqlite>=0.22.1,<1",
+    "fastapi",
+    "httpx>=0.28,<1",
+    "langchain>=1,<2",
+    "langchain-deepseek>=1,<2",
+    "langgraph>=1.2.24,<1.3",
+    "langgraph-checkpoint-sqlite>=3.1.3,<4",
+    "langsmith>=0.4,<1",
+    "markdown-it-py>=4.2,<5",
+    "mcp>=2.3,<3",
+    "numpy>=2.2,<3",
+    "openai>=2,<3",
+    "pdfplumber>=0.11.11,<0.12",
+    "python-docx>=1.2,<2",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = ["anyio", "httpx", "pytest"]
+packaging = [
+    "pyinstaller==6.22.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

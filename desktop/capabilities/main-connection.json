@@ -1,0 +1,15 @@
+{
+  "identifier": "main-connection",
+  "description": "Allow the local main WebView to connect, manage provider credentials, test SiliconFlow, open the fixed diagnostics directory, manage native file grants, and import textbooks.",
+  "webviews": ["main"],
+  "permissions": [
+    "allow-get-backend-connection",
+    "allow-save-provider-credential",
+    "allow-delete-provider-credential",
+    "allow-test-siliconflow-connection",
+    "allow-open-log-directory",
+    "allow-select-file-grant",
+    "allow-revoke-file-grant",
+    "allow-select-and-import-document"
+  ]
+}
